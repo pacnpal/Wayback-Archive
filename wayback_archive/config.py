@@ -69,6 +69,16 @@ class Config:
         else:
             self.max_files: Optional[int] = None  # Unlimited downloads
 
+        # Crawl concurrency. The main download loop runs this many worker
+        # threads against a shared work-queue. Default 1 keeps behavior
+        # identical to the historical sequential crawl; the dashboard sets
+        # FETCH_WORKERS to fan the crawl out.
+        workers_str = get_str_env("FETCH_WORKERS")
+        if workers_str and workers_str.strip().isdigit():
+            self.workers: int = max(1, int(workers_str.strip()))
+        else:
+            self.workers: int = 1
+
         # Internal state
         self.base_url: Optional[str] = None
         self.domain: Optional[str] = None
@@ -84,4 +94,3 @@ class Config:
     def __repr__(self) -> str:
         """String representation of config."""
         return f"Config(wayback_url={self.wayback_url}, output_dir={self.output_dir})"
-

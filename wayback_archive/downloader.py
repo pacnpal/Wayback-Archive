@@ -1,9 +1,13 @@
 """Core downloader module for Wayback-Archive."""
 
+import hashlib
 import os
 import posixpath
+import queue
 import re
 import sys
+import threading
+import traceback
 import mimetypes
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse, unquote
@@ -68,7 +72,71 @@ class WaybackDownloader:
         )
         # Track corrupted font files (HTML error pages instead of actual fonts)
         self.corrupted_fonts: Set[str] = set()
+        # Concurrency primitives. `_lock` guards the crawl's shared mutable
+        # state (config.visited_urls, config.downloaded_files,
+        # corrupted_fonts, the file counter and the run stats). `_tlocal`
+        # holds per-worker page context — see `_current_page_url` usage —
+        # so concurrent HTML pages don't clobber each other's relative-path
+        # base. Both are harmless no-ops in the single-worker case.
+        self._lock = threading.Lock()
+        self._tlocal = threading.local()
+        self._file_counter = 0
+        self._install_retry_adapter()
         self._parse_wayback_url()
+
+    @property
+    def _current_page_url(self):
+        """Per-worker base URL for relative-path computation.
+
+        Stored on a thread-local so the concurrent crawl can process many
+        HTML pages at once without one worker's base URL leaking into
+        another's link rewriting. Reads return None until a worker enters
+        `_process_html`.
+        """
+        return getattr(self._tlocal, "current_page_url", None)
+
+    @_current_page_url.setter
+    def _current_page_url(self, value):
+        self._tlocal.current_page_url = value
+
+    def _install_retry_adapter(self) -> None:
+        """Mount an HTTPAdapter with retry/backoff and a connection pool
+        sized for the configured worker count.
+
+        Wayback throttles aggressively; without retries a single transient
+        429/502/503/504 kicks an asset into the expensive multi-timestamp
+        fallback path. The pool is sized to the worker count so the
+        concurrent crawl doesn't serialize on urllib3's default
+        10-connection pool.
+        """
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+        except ImportError:
+            return
+        try:
+            retry = Retry(
+                total=4,
+                backoff_factor=0.8,
+                status_forcelist=(429, 502, 503, 504),
+                allowed_methods=frozenset(["GET", "HEAD"]),
+                respect_retry_after_header=True,
+                raise_on_status=False,
+            )
+        except TypeError:
+            # urllib3 < 1.26 used method_whitelist instead of allowed_methods.
+            retry = Retry(
+                total=4,
+                backoff_factor=0.8,
+                status_forcelist=(429, 502, 503, 504),
+                raise_on_status=False,
+            )
+        pool = max(16, int(getattr(self.config, "workers", 1) or 1) * 2)
+        adapter = HTTPAdapter(
+            pool_connections=pool, pool_maxsize=pool, max_retries=retry,
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _parse_wayback_url(self):
         """Parse the Wayback Machine URL to extract the original URL."""
@@ -576,7 +644,7 @@ class WaybackDownloader:
             if self._is_corrupted_font(content, url):
                 # Mark as corrupted and don't return it
                 normalized_url = self._normalize_url(url, self.config.base_url)
-                self.corrupted_fonts.add(normalized_url)
+                self._mark_corrupted_font(normalized_url)
                 print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                 return None
             
@@ -605,7 +673,7 @@ class WaybackDownloader:
                                     # Check if font file is corrupted
                                     if self._is_corrupted_font(content, url):
                                         normalized_url = self._normalize_url(url, self.config.base_url)
-                                        self.corrupted_fonts.add(normalized_url)
+                                        self._mark_corrupted_font(normalized_url)
                                         print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                                         continue  # Try next timestamp
                                     return content
@@ -619,7 +687,7 @@ class WaybackDownloader:
                                     # Check if font file is corrupted
                                     if self._is_corrupted_font(content, url):
                                         normalized_url = self._normalize_url(url, self.config.base_url)
-                                        self.corrupted_fonts.add(normalized_url)
+                                        self._mark_corrupted_font(normalized_url)
                                         print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                                         continue  # Try next timestamp
                                     return content
@@ -639,7 +707,7 @@ class WaybackDownloader:
                         # Check if font file is corrupted
                         if self._is_corrupted_font(content, url):
                             normalized_url = self._normalize_url(url, self.config.base_url)
-                            self.corrupted_fonts.add(normalized_url)
+                            self._mark_corrupted_font(normalized_url)
                             print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                             return None
                         
@@ -666,7 +734,7 @@ class WaybackDownloader:
                     # Check if font file is corrupted
                     if self._is_corrupted_font(content, url):
                         normalized_url = self._normalize_url(url, self.config.base_url)
-                        self.corrupted_fonts.add(normalized_url)
+                        self._mark_corrupted_font(normalized_url)
                         print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                         return None
                     
@@ -766,7 +834,7 @@ class WaybackDownloader:
                 response = self.session.get(wayback_url, timeout=5, allow_redirects=True)
                 if response.status_code == 200:
                     if self._is_corrupted_font(response.content, font_url):
-                        self.corrupted_fonts.add(normalized_font_url)
+                        self._mark_corrupted_font(normalized_font_url)
                         print(f"         ⚠️  Detected corrupted font in CSS: {os.path.basename(font_url)}", flush=True)
             except Exception as e:
                 # If we can't check, skip - it will be checked when actually downloaded
@@ -781,11 +849,16 @@ class WaybackDownloader:
         This prevents browsers from trying to load HTML error pages as fonts,
         which can break typography.
         """
-        if not self.corrupted_fonts:
+        # Snapshot the set under the lock: concurrent workers add to
+        # corrupted_fonts via _mark_corrupted_font, and iterating it live
+        # would risk "set changed size during iteration".
+        with self._lock:
+            corrupted_list = list(self.corrupted_fonts)
+        if not corrupted_list:
             return css
-        
-        # For each corrupted font, remove its references from CSS
-        for corrupted_font_url in self.corrupted_fonts:
+
+        # For each corrupted font, remove its references from CSS.
+        for corrupted_font_url in corrupted_list:
             # Extract just the filename from the URL
             parsed = urlparse(corrupted_font_url)
             font_filename = os.path.basename(parsed.path)
@@ -1582,7 +1655,6 @@ class WaybackDownloader:
                         # Use _get_local_path to determine where the file will be saved
                         if is_google_font:
                             # For Google Fonts, create a path like /fonts.googleapis.com/css.css
-                            import hashlib
                             query_hash = hashlib.md5(parsed_resource.query.encode()).hexdigest()[:8]
                             resource_path = f"fonts.googleapis.com/css-{query_hash}.css"
                         else:
@@ -1855,369 +1927,447 @@ class WaybackDownloader:
 
         return processed_html, links_to_follow
 
+    @staticmethod
+    def _norm_track(url: str) -> str:
+        """Normalization key for the visited-set: lowercased netloc with a
+        leading ``www.`` stripped, and no fragment or query. Matches the
+        historical sequential loop's dedup so resume/visited semantics are
+        unchanged by the move to a concurrent crawl."""
+        parsed = urlparse(url)
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return parsed._replace(netloc=netloc, fragment="", query="").geturl()
+
+    def _mark_corrupted_font(self, url: str) -> None:
+        """Thread-safe add to the corrupted-fonts set.
+
+        Concurrent workers call this from download_file / CSS processing,
+        while _remove_corrupted_fonts_from_css iterates a snapshot under
+        the same lock — so the set is never mutated mid-iteration.
+        """
+        with self._lock:
+            self.corrupted_fonts.add(url)
+
+    def _enqueue(self, raw_urls, frontier, enqueued, stop) -> None:
+        """Thread-safe dedup + enqueue of discovered links.
+
+        A link is pushed onto the frontier only if its normalized key has
+        not already been enqueued and is not already in visited_urls.
+        ``enqueued`` is keyed by the same ``_norm_track`` form as the
+        visited-set, so www/non-www variants of one page collapse to a
+        single fetch — and the O(1) lookup replaces the old O(n) linear
+        scan of the pending list.
+        """
+        for raw in raw_urls:
+            if not raw or raw.startswith("#"):
+                continue
+            try:
+                track_key = self._norm_track(raw)
+            except Exception:
+                continue
+            with self._lock:
+                if track_key in enqueued or track_key in self.config.visited_urls:
+                    continue
+                enqueued.add(track_key)
+            if stop.is_set():
+                return
+            frontier.put(raw)
+
+    def _crawl_one(self, url, frontier, enqueued, stats, stop) -> None:
+        """Download and process a single URL: fetch, detect type, write to
+        disk, and enqueue any links it references. Runs on a worker thread;
+        all shared-state mutations are guarded by ``self._lock``."""
+        # Skip fragment-only URLs (like #page, #section, etc.)
+        if url.startswith("#"):
+            return
+
+        # Normalize URL for tracking (remove query strings / www so the same
+        # file isn't downloaded twice). Claiming the URL — the membership
+        # check plus the add — happens atomically under the lock so two
+        # workers can't both process it.
+        normalized_for_tracking = self._norm_track(url)
+        with self._lock:
+            if normalized_for_tracking in self.config.visited_urls:
+                stats["skipped"] += 1
+                return
+            self.config.visited_urls.add(normalized_for_tracking)
+            self._file_counter += 1
+            current_file_num = self._file_counter
+
+        # Show status
+        file_type = self._get_file_type_from_url(url)
+        limit_info = f" (limit: {self.config.max_files})" if self.config.max_files else ""
+        print(f"[{current_file_num}{limit_info}] Downloading {file_type}: {url}", flush=True)
+        remaining = frontier.qsize()
+        if remaining:
+            print(f"         Queue: {remaining} files remaining", flush=True)
+
+        content = self.download_file(url)
+        if not content:
+            # Try CDN fallback for critical jQuery files if Wayback fails
+            if "jquery.min.js" in url.lower() and "cdn" not in url.lower():
+                cdn_urls = [
+                    "https://code.jquery.com/jquery-3.7.1.min.js",
+                    "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js",
+                ]
+                for cdn_url in cdn_urls:
+                    try:
+                        print(f"         🔄 Trying CDN fallback: {cdn_url}", flush=True)
+                        cdn_response = self.session.get(cdn_url, timeout=10, allow_redirects=True)
+                        cdn_response.raise_for_status()
+                        content = cdn_response.content
+                        print("         ✓ Downloaded from CDN fallback", flush=True)
+                        break
+                    except Exception:
+                        continue
+
+            if not content:
+                with self._lock:
+                    stats["failed"] += 1
+                print("         ⚠️  Failed to download", flush=True)
+                return
+
+        # Show file size
+        size_kb = len(content) / 1024
+        if size_kb < 1024:
+            print(f"         ✓ Downloaded ({size_kb:.1f} KB)", flush=True)
+        else:
+            print(f"         ✓ Downloaded ({size_kb/1024:.1f} MB)", flush=True)
+
+        with self._lock:
+            stats["downloaded"] += 1
+            reached_limit = bool(
+                self.config.max_files
+                and stats["downloaded"] >= self.config.max_files
+                and not stop.is_set()
+            )
+            if reached_limit:
+                stop.set()
+        if reached_limit:
+            print(f"\n{'='*70}", flush=True)
+            print(f"⚠️  Reached MAX_FILES limit ({self.config.max_files}) - stopping download", flush=True)
+            print(f"{'='*70}", flush=True)
+
+        # Determine file type with robust detection
+        try:
+            parsed = urlparse(url)
+            content_type, _ = mimetypes.guess_type(parsed.path)
+
+            # Better content type detection from URL path
+            # Check for Google Fonts CSS files first (they don't have .css extension)
+            if "fonts.googleapis.com" in url and "/css" in url:
+                content_type = "text/css"
+            elif not content_type:
+                path_lower = parsed.path.lower()
+                # Check for specific extensions
+                if path_lower.endswith(".css") or "/.css" in path_lower:
+                    content_type = "text/css"
+                elif path_lower.endswith((".js", ".mjs")) or "/.js" in path_lower:
+                    content_type = "application/javascript"
+                elif any(path_lower.endswith(ext) for ext in [".woff", ".woff2", ".ttf", ".eot", ".otf"]):
+                    content_type = "font/woff2"  # Font file
+                elif any(path_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp", ".tiff"]):
+                    content_type = "image/jpeg"  # Default, will be refined from actual content
+                elif path_lower.endswith(".json"):
+                    content_type = "application/json"
+                elif path_lower.endswith(".xml"):
+                    content_type = "application/xml"
+                elif path_lower.endswith(".pdf"):
+                    content_type = "application/pdf"
+                elif any(path_lower.endswith(ext) for ext in [".mp4", ".webm", ".ogg"]):
+                    content_type = "video/mp4"
+                elif any(path_lower.endswith(ext) for ext in [".mp3", ".wav", ".ogg"]):
+                    content_type = "audio/mpeg"
+
+            # Try to detect from actual content if still unknown
+            if not content_type and len(content) > 0:
+                # Check content signatures
+                if content.startswith(b'<!DOCTYPE') or content.startswith(b'<html') or content.startswith(b'<HTML'):
+                    content_type = "text/html"
+                elif content.startswith(b'/*') or content.startswith(b'@charset') or b'@media' in content[:200]:
+                    content_type = "text/css"
+                elif content.startswith(b'<?xml') or b'<svg' in content[:200]:
+                    content_type = "image/svg+xml"
+                elif content.startswith(b'\x89PNG'):
+                    content_type = "image/png"
+                elif content.startswith(b'\xff\xd8\xff'):
+                    content_type = "image/jpeg"
+                elif content.startswith(b'GIF'):
+                    content_type = "image/gif"
+                elif content.startswith(b'RIFF') and b'WEBP' in content[:12]:
+                    content_type = "image/webp"
+        except Exception as e:
+            print(f"Warning: Error detecting content type for {url}: {e}")
+            content_type = None
+
+        # Use normalized URL (without query strings) for file paths
+        # Exception: For Google Fonts CSS files, preserve query string in path for uniqueness
+        if "fonts.googleapis.com" in url and "/css" in url:
+            # For Google Fonts CSS, use query string hash to create unique filename
+            parsed_original = urlparse(url)
+            query_hash = hashlib.md5(parsed_original.query.encode()).hexdigest()[:8]
+            font_path = f"fonts.googleapis.com/css-{query_hash}.css"
+            local_path = self._get_local_path(f"http://{font_path}")
+        else:
+            local_path = self._get_local_path(normalized_for_tracking)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Check for Google Fonts CSS files first (they don't have .css extension)
+            is_google_fonts_css = "fonts.googleapis.com" in url and "/css" in url
+
+            # Process based on content type - be more conservative about what we treat as HTML
+            is_html = (
+                not is_google_fonts_css and (
+                    content_type == "text/html" or
+                    (not content_type and (
+                        url.endswith(".html") or
+                        url.endswith(".htm") or
+                        (parsed.path and not os.path.splitext(parsed.path)[1] and "?" not in url and not any(parsed.path.lower().endswith(ext) for ext in [".css", ".js", ".json", ".xml", ".txt"]))
+                    ))
+                )
+            )
+
+            if is_html:
+                # Process HTML
+                try:
+                    print("         Processing HTML and extracting links...", flush=True)
+                    # Try to decode as UTF-8, fallback to latin-1 or detect encoding
+                    try:
+                        html = content.decode("utf-8", errors="strict")
+                    except UnicodeDecodeError:
+                        try:
+                            html = content.decode("utf-8", errors="ignore")
+                        except Exception:
+                            # Last resort: try latin-1 which can decode any byte sequence
+                            html = content.decode("latin-1", errors="ignore")
+
+                    processed_html, new_links = self._process_html(html, url)
+                    if new_links:
+                        print(f"         Found {len(new_links)} new links to download", flush=True)
+                except Exception as e:
+                    print(f"Error processing HTML for {url}: {e}")
+                    traceback.print_exc()
+                    # Still save the raw HTML if processing fails
+                    try:
+                        with open(local_path, "wb") as f:
+                            f.write(content)
+                        with self._lock:
+                            self.config.downloaded_files[url] = str(local_path)
+                    except Exception as save_error:
+                        print(f"Error saving file {local_path}: {save_error}")
+                    return
+
+                # Save HTML
+                try:
+                    with open(local_path, "w", encoding="utf-8", errors="replace") as f:
+                        f.write(processed_html)
+                    with self._lock:
+                        self.config.downloaded_files[url] = str(local_path)
+                except Exception as e:
+                    print(f"Error saving HTML to {local_path}: {e}")
+                    return
+
+                # Add new links to the frontier (deduplicated)
+                self._enqueue(new_links, frontier, enqueued, stop)
+
+            elif content_type == "text/css":
+                # Process CSS
+                try:
+                    css = content.decode("utf-8", errors="ignore")
+                except Exception:
+                    css = content.decode("latin-1", errors="ignore")
+
+                # Point the per-worker relative-path base at this stylesheet's
+                # own URL: _rewrite_css_urls -> _make_relative_path reads
+                # _current_page_url, which is otherwise only set by
+                # _process_html — so without this a CSS file gets rewritten
+                # relative to whatever HTML page this worker handled last.
+                previous_page_url = self._current_page_url
+                self._current_page_url = url
+                try:
+                    print("         Processing CSS and extracting resources...", flush=True)
+                    # Extract URLs from CSS (images, fonts, @import, etc.)
+                    css_urls = self._extract_css_urls(css, url)
+                    if css_urls:
+                        print(f"         Found {len(css_urls)} resources in CSS", flush=True)
+                    css_to_enqueue = []
+                    for css_url in css_urls:
+                        # Handle fonts.gstatic.com URLs - these are external but available on Wayback Machine
+                        # They need to be downloaded to avoid CORS issues
+                        is_google_font = "fonts.gstatic.com" in css_url or "fonts.googleapis.com" in css_url
+                        is_squarespace_cdn = self._is_squarespace_cdn(css_url)
+                        if self._is_internal_url(css_url) or is_google_font or is_squarespace_cdn:
+                            css_to_enqueue.append(css_url)
+                            if is_google_font:
+                                print(f"         📥 Queued Google Font file for download: {css_url[:80]}...", flush=True)
+                    self._enqueue(css_to_enqueue, frontier, enqueued, stop)
+
+                    # Rewrite URLs in CSS to relative paths
+                    css = self._rewrite_css_urls(css, url)
+
+                    # Check font URLs in CSS and detect corrupted ones proactively
+                    # This ensures we catch corrupted fonts even if they haven't been downloaded yet
+                    css = self._check_and_remove_corrupted_fonts_in_css(css, url)
+
+                    # Remove references to already-detected corrupted fonts
+                    css = self._remove_corrupted_fonts_from_css(css)
+
+                    # Proactively remove .eot and .svg font format references
+                    # These are often corrupted (HTML error pages) and modern browsers don't need them
+                    # Browsers will use .woff2, .woff, and .ttf which are more reliable
+                    css = self._remove_legacy_font_formats_from_css(css)
+
+                    css = self._minify_css(css)
+                except Exception as e:
+                    print(f"Warning: Error processing CSS for {url}: {e}")
+                    # Use original content if processing fails
+                    css = content.decode("utf-8", errors="ignore")
+                finally:
+                    self._current_page_url = previous_page_url
+
+                try:
+                    with open(local_path, "w", encoding="utf-8", errors="replace") as f:
+                        f.write(css)
+                    with self._lock:
+                        self.config.downloaded_files[url] = str(local_path)
+                except Exception as e:
+                    print(f"Error saving CSS to {local_path}: {e}")
+                    return
+
+            elif content_type in ("application/javascript", "text/javascript"):
+                # Process JavaScript
+                js = content.decode("utf-8", errors="ignore")
+
+                print("         Processing JavaScript and extracting URLs...", flush=True)
+                # Extract URLs from JavaScript (may contain fetch, XMLHttpRequest, etc.)
+                js_urls = self._extract_js_urls(js, url)
+                if js_urls:
+                    print(f"         Found {len(js_urls)} URLs in JavaScript", flush=True)
+                self._enqueue(
+                    [u for u in js_urls if self._is_internal_url(u)],
+                    frontier, enqueued, stop,
+                )
+
+                js = self._minify_js(js)
+
+                with open(local_path, "w", encoding="utf-8") as f:
+                    f.write(js)
+
+                with self._lock:
+                    self.config.downloaded_files[url] = str(local_path)
+
+            elif content_type and content_type.startswith("image/"):
+                # Process images
+                format_map = {
+                    "image/jpeg": "JPEG",
+                    "image/png": "PNG",
+                    "image/gif": "GIF",
+                    "image/webp": "WEBP",
+                }
+                img_format = format_map.get(content_type, "JPEG")
+                optimized = self._optimize_image(content, img_format)
+
+                with open(local_path, "wb") as f:
+                    f.write(optimized)
+
+                with self._lock:
+                    self.config.downloaded_files[url] = str(local_path)
+
+            elif content_type and content_type.startswith("font/"):
+                # Save font files as-is
+                with open(local_path, "wb") as f:
+                    f.write(content)
+                with self._lock:
+                    self.config.downloaded_files[url] = str(local_path)
+
+            else:
+                # Save as-is
+                with open(local_path, "wb") as f:
+                    f.write(content)
+
+                with self._lock:
+                    self.config.downloaded_files[url] = str(local_path)
+        except Exception as e:
+            print(f"Error processing {url}: {e}")
+            return
+
     def download(self):
-        """Main download method."""
+        """Main download method.
+
+        Crawls the site with ``config.workers`` worker threads sharing a
+        single work-queue. Each worker claims a URL, downloads and processes
+        it, and pushes any newly discovered links back onto the queue;
+        dedup of both the visited-set and the frontier is O(1) under a
+        shared lock. With ``workers == 1`` this is a straight sequential
+        crawl, identical in behavior to the historical loop.
+        """
         # Create output directory
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
 
-        # Start with the main page
-        queue = [self.config.base_url]
-        files_downloaded = 0
-        files_failed = 0
-        files_skipped = 0
+        workers = max(1, int(getattr(self.config, "workers", 1) or 1))
 
         print(f"\n{'='*70}", flush=True)
-        print(f"Wayback-Archive Downloader", flush=True)
+        print("Wayback-Archive Downloader", flush=True)
         print(f"{'='*70}", flush=True)
         print(f"Starting URL: {self.config.base_url}", flush=True)
         print(f"Output directory: {self.config.output_dir}", flush=True)
+        print(f"Crawl workers: {workers}", flush=True)
         if self.config.max_files:
             print(f"⚠️  TEST MODE: Limited to {self.config.max_files} files", flush=True)
         print(f"{'='*70}\n", flush=True)
 
-        while queue:
-            # Check if we've reached the file limit (for testing)
-            if self.config.max_files and files_downloaded >= self.config.max_files:
-                print(f"\n{'='*70}", flush=True)
-                print(f"⚠️  Reached MAX_FILES limit ({self.config.max_files}) - stopping download", flush=True)
-                print(f"{'='*70}", flush=True)
-                break
-            
-            queue_size = len(queue)
-            url = queue.pop(0)
-            
-            # Skip fragment-only URLs (like #page, #section, etc.)
-            if url.startswith("#"):
-                continue
-            
-            # Normalize URL for tracking (remove query strings to avoid downloading same file twice)
-            parsed_url = urlparse(url)
-            # Normalize www/non-www to avoid downloading same page twice
-            netloc_normalized = parsed_url.netloc.lower().lstrip("www.")
-            parsed_normalized = parsed_url._replace(netloc=netloc_normalized, fragment="", query="")
-            normalized_for_tracking = parsed_normalized.geturl()
+        # Shared crawl state.
+        frontier: "queue.Queue" = queue.Queue()
+        enqueued: Set[str] = set()
+        stats = {"downloaded": 0, "failed": 0, "skipped": 0}
+        stop = threading.Event()
+        _SENTINEL = object()
 
-            if normalized_for_tracking in self.config.visited_urls:
-                files_skipped += 1
-                continue
+        base = self.config.base_url
+        frontier.put(base)
+        try:
+            enqueued.add(self._norm_track(base))
+        except Exception:
+            pass
 
-            # Show status
-            file_type = self._get_file_type_from_url(url)
-            current_file_num = len(self.config.visited_urls) + 1
-            limit_info = f" (limit: {self.config.max_files})" if self.config.max_files else ""
-            print(f"[{current_file_num}{limit_info}] Downloading {file_type}: {url}", flush=True)
-            if queue_size > 1:
-                print(f"         Queue: {queue_size - 1} files remaining", flush=True)
-            
-            self.config.visited_urls.add(normalized_for_tracking)
+        def _worker() -> None:
+            while True:
+                item = frontier.get()
+                if item is _SENTINEL:
+                    frontier.task_done()
+                    return
+                try:
+                    if not stop.is_set():
+                        self._crawl_one(item, frontier, enqueued, stats, stop)
+                except Exception as e:
+                    print(f"Error processing {item}: {e}", flush=True)
+                finally:
+                    frontier.task_done()
 
-            content = self.download_file(url)
-            if not content:
-                # Try CDN fallback for critical jQuery files if Wayback fails
-                if "jquery.min.js" in url.lower() and "cdn" not in url.lower():
-                    cdn_urls = [
-                        "https://code.jquery.com/jquery-3.7.1.min.js",
-                        "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js",
-                    ]
-                    for cdn_url in cdn_urls:
-                        try:
-                            print(f"         🔄 Trying CDN fallback: {cdn_url}", flush=True)
-                            cdn_response = self.session.get(cdn_url, timeout=10, allow_redirects=True)
-                            cdn_response.raise_for_status()
-                            content = cdn_response.content
-                            print(f"         ✓ Downloaded from CDN fallback", flush=True)
-                            break
-                        except:
-                            continue
-                
-                if not content:
-                    files_failed += 1
-                    print(f"         ⚠️  Failed to download", flush=True)
-                    continue
-            
-            # Show file size
-            size_kb = len(content) / 1024
-            if size_kb < 1024:
-                print(f"         ✓ Downloaded ({size_kb:.1f} KB)", flush=True)
-            else:
-                print(f"         ✓ Downloaded ({size_kb/1024:.1f} MB)", flush=True)
-            
-            files_downloaded += 1
-
-            # Determine file type with robust detection
-            try:
-                parsed = urlparse(url)
-                content_type, _ = mimetypes.guess_type(parsed.path)
-                
-                # Better content type detection from URL path
-                # Check for Google Fonts CSS files first (they don't have .css extension)
-                if "fonts.googleapis.com" in url and "/css" in url:
-                    content_type = "text/css"
-                elif not content_type:
-                    path_lower = parsed.path.lower()
-                    # Check for specific extensions
-                    if path_lower.endswith(".css") or "/.css" in path_lower:
-                        content_type = "text/css"
-                    elif path_lower.endswith((".js", ".mjs")) or "/.js" in path_lower:
-                        content_type = "application/javascript"
-                    elif any(path_lower.endswith(ext) for ext in [".woff", ".woff2", ".ttf", ".eot", ".otf"]):
-                        content_type = "font/woff2"  # Font file
-                    elif any(path_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp", ".tiff"]):
-                        content_type = "image/jpeg"  # Default, will be refined from actual content
-                    elif path_lower.endswith(".json"):
-                        content_type = "application/json"
-                    elif path_lower.endswith(".xml"):
-                        content_type = "application/xml"
-                    elif path_lower.endswith(".pdf"):
-                        content_type = "application/pdf"
-                    elif any(path_lower.endswith(ext) for ext in [".mp4", ".webm", ".ogg"]):
-                        content_type = "video/mp4"
-                    elif any(path_lower.endswith(ext) for ext in [".mp3", ".wav", ".ogg"]):
-                        content_type = "audio/mpeg"
-                
-                # Try to detect from actual content if still unknown
-                if not content_type and len(content) > 0:
-                    # Check content signatures
-                    if content.startswith(b'<!DOCTYPE') or content.startswith(b'<html') or content.startswith(b'<HTML'):
-                        content_type = "text/html"
-                    elif content.startswith(b'/*') or content.startswith(b'@charset') or b'@media' in content[:200]:
-                        content_type = "text/css"
-                    elif content.startswith(b'<?xml') or b'<svg' in content[:200]:
-                        content_type = "image/svg+xml"
-                    elif content.startswith(b'\x89PNG'):
-                        content_type = "image/png"
-                    elif content.startswith(b'\xff\xd8\xff'):
-                        content_type = "image/jpeg"
-                    elif content.startswith(b'GIF'):
-                        content_type = "image/gif"
-                    elif content.startswith(b'RIFF') and b'WEBP' in content[:12]:
-                        content_type = "image/webp"
-            except Exception as e:
-                print(f"Warning: Error detecting content type for {url}: {e}")
-                content_type = None
-            
-            # Use normalized URL (without query strings) for file paths
-            # Exception: For Google Fonts CSS files, preserve query string in path for uniqueness
-            if "fonts.googleapis.com" in url and "/css" in url:
-                # For Google Fonts CSS, use query string hash to create unique filename
-                import hashlib
-                parsed_original = urlparse(url)
-                query_hash = hashlib.md5(parsed_original.query.encode()).hexdigest()[:8]
-                font_path = f"fonts.googleapis.com/css-{query_hash}.css"
-                local_path = self._get_local_path(f"http://{font_path}")
-            else:
-                local_path = self._get_local_path(normalized_for_tracking)
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            try:
-                # Check for Google Fonts CSS files first (they don't have .css extension)
-                is_google_fonts_css = "fonts.googleapis.com" in url and "/css" in url
-                
-                # Process based on content type - be more conservative about what we treat as HTML
-                is_html = (
-                    not is_google_fonts_css and (
-                        content_type == "text/html" or 
-                        (not content_type and (
-                            url.endswith(".html") or 
-                            url.endswith(".htm") or
-                            (parsed.path and not os.path.splitext(parsed.path)[1] and "?" not in url and not any(parsed.path.lower().endswith(ext) for ext in [".css", ".js", ".json", ".xml", ".txt"]))
-                        ))
-                    )
-                )
-                
-                if is_html:
-                    # Process HTML
-                    try:
-                        print(f"         Processing HTML and extracting links...", flush=True)
-                        # Try to decode as UTF-8, fallback to latin-1 or detect encoding
-                        try:
-                            html = content.decode("utf-8", errors="strict")
-                        except UnicodeDecodeError:
-                            try:
-                                html = content.decode("utf-8", errors="ignore")
-                            except Exception:
-                                # Last resort: try latin-1 which can decode any byte sequence
-                                html = content.decode("latin-1", errors="ignore")
-                        
-                        processed_html, new_links = self._process_html(html, url)
-                        if new_links:
-                            print(f"         Found {len(new_links)} new links to download", flush=True)
-                    except Exception as e:
-                        print(f"Error processing HTML for {url}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Still save the raw HTML if processing fails
-                        try:
-                            with open(local_path, "wb") as f:
-                                f.write(content)
-                            self.config.downloaded_files[url] = str(local_path)
-                        except Exception as save_error:
-                            print(f"Error saving file {local_path}: {save_error}")
-                        continue
-
-                    # Save HTML
-                    try:
-                        with open(local_path, "w", encoding="utf-8", errors="replace") as f:
-                            f.write(processed_html)
-                        self.config.downloaded_files[url] = str(local_path)
-                    except Exception as e:
-                        print(f"Error saving HTML to {local_path}: {e}")
-                        continue
-
-                    # Add new links to queue (deduplicate)
-                    for link_url in new_links:
-                        # Normalize for tracking (to avoid downloading same file multiple times)
-                        parsed_link = urlparse(link_url)
-                        normalized_link = parsed_link._replace(fragment="", query="").geturl()
-                        if normalized_link not in self.config.visited_urls:
-                            # Check if already in queue (normalize queue items too)
-                            in_queue = False
-                            for q_url in queue:
-                                parsed_q = urlparse(q_url)
-                                normalized_q = parsed_q._replace(fragment="", query="").geturl()
-                                if normalized_q == normalized_link:
-                                    in_queue = True
-                                    break
-                            if not in_queue:
-                                queue.append(link_url)
-
-                elif content_type == "text/css":
-                    # Process CSS
-                    try:
-                        css = content.decode("utf-8", errors="ignore")
-                    except Exception:
-                        css = content.decode("latin-1", errors="ignore")
-                    
-                    try:
-                        print(f"         Processing CSS and extracting resources...", flush=True)
-                        # Extract URLs from CSS (images, fonts, @import, etc.)
-                        css_urls = self._extract_css_urls(css, url)
-                        if css_urls:
-                            print(f"         Found {len(css_urls)} resources in CSS", flush=True)
-                        for css_url in css_urls:
-                            # Normalize for tracking
-                            parsed_css = urlparse(css_url)
-                            normalized_css = parsed_css._replace(fragment="", query="").geturl()
-                            # Handle fonts.gstatic.com URLs - these are external but available on Wayback Machine
-                            # They need to be downloaded to avoid CORS issues
-                            is_google_font = "fonts.gstatic.com" in css_url or "fonts.googleapis.com" in css_url
-                            is_squarespace_cdn = self._is_squarespace_cdn(css_url)
-                            if normalized_css not in self.config.visited_urls and (self._is_internal_url(css_url) or is_google_font or is_squarespace_cdn):
-                                # Check if already in queue
-                                in_queue = False
-                                for q_url in queue:
-                                    parsed_q = urlparse(q_url)
-                                    normalized_q = parsed_q._replace(fragment="", query="").geturl()
-                                    if normalized_q == normalized_css:
-                                        in_queue = True
-                                        break
-                                if not in_queue:
-                                    queue.append(css_url)
-                                    if is_google_font:
-                                        print(f"         📥 Queued Google Font file for download: {css_url[:80]}...", flush=True)
-                        
-                        # Rewrite URLs in CSS to relative paths
-                        css = self._rewrite_css_urls(css, url)
-                        
-                        # Check font URLs in CSS and detect corrupted ones proactively
-                        # This ensures we catch corrupted fonts even if they haven't been downloaded yet
-                        css = self._check_and_remove_corrupted_fonts_in_css(css, url)
-                        
-                        # Remove references to already-detected corrupted fonts
-                        css = self._remove_corrupted_fonts_from_css(css)
-                        
-                        # Proactively remove .eot and .svg font format references
-                        # These are often corrupted (HTML error pages) and modern browsers don't need them
-                        # Browsers will use .woff2, .woff, and .ttf which are more reliable
-                        css = self._remove_legacy_font_formats_from_css(css)
-                        
-                        css = self._minify_css(css)
-                    except Exception as e:
-                        print(f"Warning: Error processing CSS for {url}: {e}")
-                        # Use original content if processing fails
-                        css = content.decode("utf-8", errors="ignore")
-
-                    try:
-                        with open(local_path, "w", encoding="utf-8", errors="replace") as f:
-                            f.write(css)
-                        self.config.downloaded_files[url] = str(local_path)
-                    except Exception as e:
-                        print(f"Error saving CSS to {local_path}: {e}")
-                        continue
-
-                elif content_type in ("application/javascript", "text/javascript"):
-                    # Process JavaScript
-                    js = content.decode("utf-8", errors="ignore")
-                    
-                    print(f"         Processing JavaScript and extracting URLs...", flush=True)
-                    # Extract URLs from JavaScript (may contain fetch, XMLHttpRequest, etc.)
-                    js_urls = self._extract_js_urls(js, url)
-                    if js_urls:
-                        print(f"         Found {len(js_urls)} URLs in JavaScript", flush=True)
-                    for js_url in js_urls:
-                        # Normalize for tracking
-                        parsed_js = urlparse(js_url)
-                        normalized_js = parsed_js._replace(fragment="", query="").geturl()
-                        if normalized_js not in self.config.visited_urls and self._is_internal_url(js_url):
-                            # Check if already in queue
-                            in_queue = False
-                            for q_url in queue:
-                                parsed_q = urlparse(q_url)
-                                normalized_q = parsed_q._replace(fragment="", query="").geturl()
-                                if normalized_q == normalized_js:
-                                    in_queue = True
-                                    break
-                            if not in_queue:
-                                queue.append(js_url)
-                    
-                    js = self._minify_js(js)
-
-                    with open(local_path, "w", encoding="utf-8") as f:
-                        f.write(js)
-
-                    self.config.downloaded_files[url] = str(local_path)
-
-                elif content_type and content_type.startswith("image/"):
-                    # Process images
-                    format_map = {
-                        "image/jpeg": "JPEG",
-                        "image/png": "PNG",
-                        "image/gif": "GIF",
-                        "image/webp": "WEBP",
-                    }
-                    img_format = format_map.get(content_type, "JPEG")
-                    optimized = self._optimize_image(content, img_format)
-
-                    with open(local_path, "wb") as f:
-                        f.write(optimized)
-
-                    self.config.downloaded_files[url] = str(local_path)
-
-                elif content_type and content_type.startswith("font/"):
-                    # Save font files as-is
-                    with open(local_path, "wb") as f:
-                        f.write(content)
-                    self.config.downloaded_files[url] = str(local_path)
-
-                else:
-                    # Save as-is
-                    with open(local_path, "wb") as f:
-                        f.write(content)
-
-                    self.config.downloaded_files[url] = str(local_path)
-            except Exception as e:
-                print(f"Error processing {url}: {e}")
-                continue
+        threads = [
+            threading.Thread(target=_worker, name=f"wa-crawl-{i}", daemon=True)
+            for i in range(workers)
+        ]
+        for t in threads:
+            t.start()
+        # Block until the frontier is fully drained (every put has a matching
+        # task_done), then release the workers with one sentinel each.
+        frontier.join()
+        for _ in threads:
+            frontier.put(_SENTINEL)
+        for t in threads:
+            t.join()
 
         print(f"\n{'='*70}", flush=True)
-        print(f"Download Complete!", flush=True)
+        print("Download Complete!", flush=True)
         print(f"{'='*70}", flush=True)
         print(f"Output directory: {self.config.output_dir}", flush=True)
-        print(f"Files successfully downloaded: {files_downloaded}", flush=True)
-        print(f"Files failed: {files_failed}", flush=True)
-        print(f"Files skipped (duplicates): {files_skipped}", flush=True)
+        print(f"Files successfully downloaded: {stats['downloaded']}", flush=True)
+        print(f"Files failed: {stats['failed']}", flush=True)
+        print(f"Files skipped (duplicates): {stats['skipped']}", flush=True)
         if self.corrupted_fonts:
             print(f"Corrupted fonts detected and removed: {len(self.corrupted_fonts)}", flush=True)
         print(f"Total files processed: {len(self.config.visited_urls)}", flush=True)
         print(f"{'='*70}\n", flush=True)
-
