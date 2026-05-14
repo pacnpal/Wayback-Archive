@@ -1,11 +1,13 @@
 """Core downloader module for Wayback-Archive."""
 
+import hashlib
 import os
 import posixpath
 import queue
 import re
 import sys
 import threading
+import traceback
 import mimetypes
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse, unquote
@@ -642,7 +644,7 @@ class WaybackDownloader:
             if self._is_corrupted_font(content, url):
                 # Mark as corrupted and don't return it
                 normalized_url = self._normalize_url(url, self.config.base_url)
-                self.corrupted_fonts.add(normalized_url)
+                self._mark_corrupted_font(normalized_url)
                 print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                 return None
             
@@ -671,7 +673,7 @@ class WaybackDownloader:
                                     # Check if font file is corrupted
                                     if self._is_corrupted_font(content, url):
                                         normalized_url = self._normalize_url(url, self.config.base_url)
-                                        self.corrupted_fonts.add(normalized_url)
+                                        self._mark_corrupted_font(normalized_url)
                                         print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                                         continue  # Try next timestamp
                                     return content
@@ -685,7 +687,7 @@ class WaybackDownloader:
                                     # Check if font file is corrupted
                                     if self._is_corrupted_font(content, url):
                                         normalized_url = self._normalize_url(url, self.config.base_url)
-                                        self.corrupted_fonts.add(normalized_url)
+                                        self._mark_corrupted_font(normalized_url)
                                         print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                                         continue  # Try next timestamp
                                     return content
@@ -705,7 +707,7 @@ class WaybackDownloader:
                         # Check if font file is corrupted
                         if self._is_corrupted_font(content, url):
                             normalized_url = self._normalize_url(url, self.config.base_url)
-                            self.corrupted_fonts.add(normalized_url)
+                            self._mark_corrupted_font(normalized_url)
                             print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                             return None
                         
@@ -732,7 +734,7 @@ class WaybackDownloader:
                     # Check if font file is corrupted
                     if self._is_corrupted_font(content, url):
                         normalized_url = self._normalize_url(url, self.config.base_url)
-                        self.corrupted_fonts.add(normalized_url)
+                        self._mark_corrupted_font(normalized_url)
                         print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                         return None
                     
@@ -832,7 +834,7 @@ class WaybackDownloader:
                 response = self.session.get(wayback_url, timeout=5, allow_redirects=True)
                 if response.status_code == 200:
                     if self._is_corrupted_font(response.content, font_url):
-                        self.corrupted_fonts.add(normalized_font_url)
+                        self._mark_corrupted_font(normalized_font_url)
                         print(f"         ⚠️  Detected corrupted font in CSS: {os.path.basename(font_url)}", flush=True)
             except Exception as e:
                 # If we can't check, skip - it will be checked when actually downloaded
@@ -847,13 +849,16 @@ class WaybackDownloader:
         This prevents browsers from trying to load HTML error pages as fonts,
         which can break typography.
         """
-        if not self.corrupted_fonts:
+        # Snapshot the set under the lock: concurrent workers add to
+        # corrupted_fonts via _mark_corrupted_font, and iterating it live
+        # would risk "set changed size during iteration".
+        with self._lock:
+            corrupted_list = list(self.corrupted_fonts)
+        if not corrupted_list:
             return css
 
         # For each corrupted font, remove its references from CSS.
-        # Snapshot the set first: a concurrent worker's download_file may
-        # add to corrupted_fonts mid-iteration.
-        for corrupted_font_url in list(self.corrupted_fonts):
+        for corrupted_font_url in corrupted_list:
             # Extract just the filename from the URL
             parsed = urlparse(corrupted_font_url)
             font_filename = os.path.basename(parsed.path)
@@ -1650,7 +1655,6 @@ class WaybackDownloader:
                         # Use _get_local_path to determine where the file will be saved
                         if is_google_font:
                             # For Google Fonts, create a path like /fonts.googleapis.com/css.css
-                            import hashlib
                             query_hash = hashlib.md5(parsed_resource.query.encode()).hexdigest()[:8]
                             resource_path = f"fonts.googleapis.com/css-{query_hash}.css"
                         else:
@@ -1930,29 +1934,42 @@ class WaybackDownloader:
         historical sequential loop's dedup so resume/visited semantics are
         unchanged by the move to a concurrent crawl."""
         parsed = urlparse(url)
-        netloc = parsed.netloc.lower().lstrip("www.")
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
         return parsed._replace(netloc=netloc, fragment="", query="").geturl()
+
+    def _mark_corrupted_font(self, url: str) -> None:
+        """Thread-safe add to the corrupted-fonts set.
+
+        Concurrent workers call this from download_file / CSS processing,
+        while _remove_corrupted_fonts_from_css iterates a snapshot under
+        the same lock — so the set is never mutated mid-iteration.
+        """
+        with self._lock:
+            self.corrupted_fonts.add(url)
 
     def _enqueue(self, raw_urls, frontier, enqueued, stop) -> None:
         """Thread-safe dedup + enqueue of discovered links.
 
-        A link is pushed onto the frontier only if it has not already been
-        enqueued and its normalized form is not already in visited_urls.
-        ``enqueued`` is the set of every link key ever queued — it replaces
-        the old O(n) linear scan of the pending list with an O(1) lookup.
+        A link is pushed onto the frontier only if its normalized key has
+        not already been enqueued and is not already in visited_urls.
+        ``enqueued`` is keyed by the same ``_norm_track`` form as the
+        visited-set, so www/non-www variants of one page collapse to a
+        single fetch — and the O(1) lookup replaces the old O(n) linear
+        scan of the pending list.
         """
         for raw in raw_urls:
             if not raw or raw.startswith("#"):
                 continue
             try:
-                key = urlparse(raw)._replace(fragment="", query="").geturl()
                 track_key = self._norm_track(raw)
             except Exception:
                 continue
             with self._lock:
-                if key in enqueued or track_key in self.config.visited_urls:
+                if track_key in enqueued or track_key in self.config.visited_urls:
                     continue
-                enqueued.add(key)
+                enqueued.add(track_key)
             if stop.is_set():
                 return
             frontier.put(raw)
@@ -2000,15 +2017,15 @@ class WaybackDownloader:
                         cdn_response = self.session.get(cdn_url, timeout=10, allow_redirects=True)
                         cdn_response.raise_for_status()
                         content = cdn_response.content
-                        print(f"         ✓ Downloaded from CDN fallback", flush=True)
+                        print("         ✓ Downloaded from CDN fallback", flush=True)
                         break
-                    except:
+                    except Exception:
                         continue
 
             if not content:
                 with self._lock:
                     stats["failed"] += 1
-                print(f"         ⚠️  Failed to download", flush=True)
+                print("         ⚠️  Failed to download", flush=True)
                 return
 
         # Show file size
@@ -2088,7 +2105,6 @@ class WaybackDownloader:
         # Exception: For Google Fonts CSS files, preserve query string in path for uniqueness
         if "fonts.googleapis.com" in url and "/css" in url:
             # For Google Fonts CSS, use query string hash to create unique filename
-            import hashlib
             parsed_original = urlparse(url)
             query_hash = hashlib.md5(parsed_original.query.encode()).hexdigest()[:8]
             font_path = f"fonts.googleapis.com/css-{query_hash}.css"
@@ -2116,7 +2132,7 @@ class WaybackDownloader:
             if is_html:
                 # Process HTML
                 try:
-                    print(f"         Processing HTML and extracting links...", flush=True)
+                    print("         Processing HTML and extracting links...", flush=True)
                     # Try to decode as UTF-8, fallback to latin-1 or detect encoding
                     try:
                         html = content.decode("utf-8", errors="strict")
@@ -2132,7 +2148,6 @@ class WaybackDownloader:
                         print(f"         Found {len(new_links)} new links to download", flush=True)
                 except Exception as e:
                     print(f"Error processing HTML for {url}: {e}")
-                    import traceback
                     traceback.print_exc()
                     # Still save the raw HTML if processing fails
                     try:
@@ -2164,8 +2179,15 @@ class WaybackDownloader:
                 except Exception:
                     css = content.decode("latin-1", errors="ignore")
 
+                # Point the per-worker relative-path base at this stylesheet's
+                # own URL: _rewrite_css_urls -> _make_relative_path reads
+                # _current_page_url, which is otherwise only set by
+                # _process_html — so without this a CSS file gets rewritten
+                # relative to whatever HTML page this worker handled last.
+                previous_page_url = self._current_page_url
+                self._current_page_url = url
                 try:
-                    print(f"         Processing CSS and extracting resources...", flush=True)
+                    print("         Processing CSS and extracting resources...", flush=True)
                     # Extract URLs from CSS (images, fonts, @import, etc.)
                     css_urls = self._extract_css_urls(css, url)
                     if css_urls:
@@ -2202,6 +2224,8 @@ class WaybackDownloader:
                     print(f"Warning: Error processing CSS for {url}: {e}")
                     # Use original content if processing fails
                     css = content.decode("utf-8", errors="ignore")
+                finally:
+                    self._current_page_url = previous_page_url
 
                 try:
                     with open(local_path, "w", encoding="utf-8", errors="replace") as f:
@@ -2216,7 +2240,7 @@ class WaybackDownloader:
                 # Process JavaScript
                 js = content.decode("utf-8", errors="ignore")
 
-                print(f"         Processing JavaScript and extracting URLs...", flush=True)
+                print("         Processing JavaScript and extracting URLs...", flush=True)
                 # Extract URLs from JavaScript (may contain fetch, XMLHttpRequest, etc.)
                 js_urls = self._extract_js_urls(js, url)
                 if js_urls:
@@ -2285,7 +2309,7 @@ class WaybackDownloader:
         workers = max(1, int(getattr(self.config, "workers", 1) or 1))
 
         print(f"\n{'='*70}", flush=True)
-        print(f"Wayback-Archive Downloader", flush=True)
+        print("Wayback-Archive Downloader", flush=True)
         print(f"{'='*70}", flush=True)
         print(f"Starting URL: {self.config.base_url}", flush=True)
         print(f"Output directory: {self.config.output_dir}", flush=True)
@@ -2304,7 +2328,7 @@ class WaybackDownloader:
         base = self.config.base_url
         frontier.put(base)
         try:
-            enqueued.add(urlparse(base)._replace(fragment="", query="").geturl())
+            enqueued.add(self._norm_track(base))
         except Exception:
             pass
 
@@ -2337,7 +2361,7 @@ class WaybackDownloader:
             t.join()
 
         print(f"\n{'='*70}", flush=True)
-        print(f"Download Complete!", flush=True)
+        print("Download Complete!", flush=True)
         print(f"{'='*70}", flush=True)
         print(f"Output directory: {self.config.output_dir}", flush=True)
         print(f"Files successfully downloaded: {stats['downloaded']}", flush=True)

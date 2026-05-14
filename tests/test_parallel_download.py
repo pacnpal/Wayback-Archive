@@ -194,7 +194,9 @@ def test_current_page_url_is_thread_local(tmp_path):
     never leaks into another's relative-path base."""
     dl = _make_downloader(tmp_path, 1)
     seen = {}
-    barrier = threading.Barrier(3)
+    # Timeouts so a worker that errors before reaching the barrier fails the
+    # test fast instead of hanging the suite.
+    barrier = threading.Barrier(3, timeout=5)
 
     def worker(name):
         dl._current_page_url = f"http://example.com/{name}"
@@ -205,7 +207,8 @@ def test_current_page_url_is_thread_local(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=5)
+    assert all(not t.is_alive() for t in threads)
 
     assert seen == {
         "x": "http://example.com/x",
