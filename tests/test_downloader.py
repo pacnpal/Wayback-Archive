@@ -194,10 +194,10 @@ class TestWaybackDownloader:
         the same font once per CSS file that referenced it, producing the same large
         file with status=ok 5-6× in a single run.
         """
-        # Simulate a non-corrupted font response (valid woff2 header bytes)
+        # Simulate a non-corrupted font response (binary content, not HTML)
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.content = b"\x00\x01\x00\x00" * 100  # binary, not HTML
+        mock_response.content = b"\x00\x01\x00\x00" * 100  # sfnt/TrueType header bytes, not HTML
         mock_get.return_value = mock_response
 
         font_url = "http://example.com/fonts/my-font.woff2"
@@ -216,4 +216,44 @@ class TestWaybackDownloader:
         # The font URL should be recorded in the pre-checked set
         normalized = self.downloader._normalize_url(font_url, base_url)
         assert normalized in self.downloader._font_prefetch_checked
+
+    @patch("wayback_archive.downloader.requests.Session.get")
+    def test_font_prefetch_checked_only_once_concurrent(self, mock_get):
+        """Font URL is pre-checked at most once even when multiple threads process
+        CSS files referencing the same font simultaneously.
+
+        The cache is documented as lock-guarded; this test exercises the atomic
+        reserve-then-fetch path so that concurrent workers cannot race past the
+        membership check and issue duplicate downloads.
+        """
+        import threading
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.content = b"\x00\x01\x00\x00" * 100  # sfnt/TrueType header bytes, not HTML
+        mock_get.return_value = mock_response
+
+        font_url = "http://example.com/fonts/concurrent-font.woff2"
+        css_template = f"@font-face {{ src: url('{font_url}') format('woff2'); }}"
+        base_url = "http://example.com/css/style.css"
+
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def run():
+            try:
+                barrier.wait()  # synchronise all threads to start simultaneously
+                self.downloader._check_and_remove_corrupted_fonts_in_css(css_template, base_url)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Worker thread raised: {errors}"
+        # Despite concurrent execution, the font must have been fetched at most once
+        assert mock_get.call_count <= 1
 

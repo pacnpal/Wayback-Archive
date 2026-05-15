@@ -836,19 +836,20 @@ class WaybackDownloader:
             # Normalize URL
             normalized_font_url = self._normalize_url(font_url, base_url)
             
-            # Skip if already in corrupted set OR already pre-checked (thread-safe).
-            # Both sets are guarded by _lock so workers can't race past this check.
+            # Skip if already corrupted or already reserved for checking (atomic).
+            # The URL is added to _font_prefetch_checked inside the SAME lock
+            # acquisition as the membership test, so no concurrent worker can
+            # slip past the check before the reservation is recorded.
             with self._lock:
-                already_handled = (
+                if (
                     normalized_font_url in self.corrupted_fonts
                     or normalized_font_url in self._font_prefetch_checked
-                )
-            if already_handled:
-                continue
-            
+                ):
+                    continue
+                # Reserve this URL; other workers will see it and skip.
+                self._font_prefetch_checked.add(normalized_font_url)
+
             # Try to download and check if corrupted (with quick timeout).
-            # Always mark as pre-checked afterwards — even on network failure —
-            # so later CSS files don't retry the same URL.
             try:
                 wayback_url = self._convert_to_wayback_url_with_timestamp(font_url)
                 response = self.session.get(wayback_url, timeout=5, allow_redirects=True)
@@ -857,13 +858,10 @@ class WaybackDownloader:
                         self._mark_corrupted_font(normalized_font_url)
                         print(f"         ⚠️  Detected corrupted font in CSS: {os.path.basename(font_url)}", flush=True)
             except Exception:
-                # If we can't check, skip - it will be checked when actually downloaded
-                # Don't print errors here to avoid spam
-                pass
-            finally:
-                # Record that this URL has been pre-checked, regardless of outcome.
+                # On network failure, un-reserve so a later CSS file can retry.
+                # Don't print errors here to avoid spam.
                 with self._lock:
-                    self._font_prefetch_checked.add(normalized_font_url)
+                    self._font_prefetch_checked.discard(normalized_font_url)
         
         return css
     
