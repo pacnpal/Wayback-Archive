@@ -89,6 +89,27 @@ class Config:
         # haven't existed in decades.
         self.archive_only: bool = get_bool_env("ARCHIVE_ONLY", False)
 
+        # Auto-search snapshots via the Wayback CDX index. When a file is
+        # missing at the original timestamp and the brute-force +/- timeframe
+        # scan turns up nothing, the downloader queries
+        # web.archive.org/cdx/search/cdx for every successful capture of the
+        # URL and tries the captures closest to the original timestamp.
+        # This is how pieces of a partially-archived site get put back
+        # together: an asset that was only captured at a totally different
+        # date than the page that references it still gets pulled in.
+        # Default on. Set AUTO_SEARCH_SNAPSHOTS=0 to disable and skip the
+        # extra CDX request per miss.
+        self.auto_search_snapshots: bool = get_bool_env("AUTO_SEARCH_SNAPSHOTS", True)
+
+        # How many CDX-discovered candidate timestamps to try per URL before
+        # giving up. The list is sorted by proximity to the original
+        # timestamp, so a small limit still favors the closest captures.
+        cdx_limit_str = get_str_env("AUTO_SEARCH_SNAPSHOTS_LIMIT")
+        if cdx_limit_str and cdx_limit_str.strip().isdigit():
+            self.auto_search_snapshots_limit: int = max(1, int(cdx_limit_str.strip()))
+        else:
+            self.auto_search_snapshots_limit: int = 10
+
         # Internal state
         self.base_url: Optional[str] = None
         self.domain: Optional[str] = None

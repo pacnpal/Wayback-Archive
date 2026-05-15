@@ -568,6 +568,100 @@ class WaybackDownloader:
             from_dir = posixpath.dirname(from_path)
         return posixpath.relpath(abs_path, from_dir or "/")
 
+    def _search_snapshots_via_cdx(self, url: str) -> List[str]:
+        """Query the Wayback CDX index for actual successful captures of url.
+
+        The brute-force +/- timeframe scan in ``download_file`` guesses
+        timestamps that may not be valid captures at all. The CDX API tells
+        us exactly which timestamps DO have a 200 capture, so when an asset
+        was only archived at a wildly different date than the page that
+        references it, we can still pull it in.
+
+        Returns a list of timestamp strings (YYYYMMDDHHMMSS), sorted by
+        proximity to the run's original timestamp so the closest captures
+        are tried first. Capped at ``config.auto_search_snapshots_limit``.
+        Cached per URL so repeated misses on the same asset don't re-query
+        CDX. On any error, returns ``[]`` and caches the empty result.
+        """
+        try:
+            cache = self._cdx_cache
+        except AttributeError:
+            with self._lock:
+                if not hasattr(self, '_cdx_cache'):
+                    self._cdx_cache = {}
+            cache = self._cdx_cache
+        if url in cache:
+            return cache[url]
+
+        result: List[str] = []
+        try:
+            from urllib.parse import quote
+            cdx_url = (
+                "https://web.archive.org/cdx/search/cdx"
+                f"?url={quote(url, safe='')}"
+                "&output=json"
+                "&fl=timestamp,statuscode,mimetype"
+                "&filter=statuscode:200"
+                "&filter=!mimetype:warc/revisit"
+                "&limit=200"
+            )
+            response = self.session.get(cdx_url, timeout=15)
+            response.raise_for_status()
+            rows = response.json()
+            # First row is the header (["timestamp","statuscode","mimetype"]).
+            timestamps = [row[0] for row in rows[1:]] if len(rows) > 1 else []
+
+            def _proximity(ts: str) -> float:
+                try:
+                    return abs(
+                        (datetime.strptime(ts[:14], '%Y%m%d%H%M%S')
+                         - self.original_datetime).total_seconds()
+                    )
+                except Exception:
+                    return float('inf')
+
+            timestamps.sort(key=_proximity)
+            # Drop the original timestamp itself — download_file already
+            # tried it before falling through to CDX search.
+            original = getattr(self, 'original_timestamp', None)
+            if original:
+                timestamps = [t for t in timestamps if t != original]
+            result = timestamps[: self.config.auto_search_snapshots_limit]
+        except Exception:
+            result = []
+
+        with self._lock:
+            self._cdx_cache[url] = result
+        return result
+
+    def _fetch_at_timestamp(self, url: str, timestamp: Optional[str],
+                            is_html_page: bool, timeout: int = 10
+                            ) -> Optional[bytes]:
+        """Try to download ``url`` at a specific Wayback ``timestamp``.
+
+        Returns the response bytes on a 200 OK, or None on any failure
+        (including a font response that was actually an HTML error page —
+        those get recorded in ``corrupted_fonts``). Shared by both the
+        brute-force timeframe scan and the CDX-driven snapshot search so
+        they apply the same prefix selection and corruption check.
+        """
+        try:
+            wayback_url = self._convert_to_wayback_url_with_timestamp(
+                url, timestamp, use_iframe=is_html_page,
+            )
+            response = self.session.get(wayback_url, timeout=timeout,
+                                        allow_redirects=True)
+            if response.status_code != 200:
+                return None
+            content = response.content
+            if self._is_corrupted_font(content, url):
+                normalized_url = self._normalize_url(url, self.config.base_url)
+                self._mark_corrupted_font(normalized_url)
+                return None
+            return content
+        except Exception:
+            return None
+
     def _generate_timestamp_variants(self, hours_range: int = 24, step_hours: int = 1) -> List[str]:
         """Generate timestamp variants for timeframe search.
         
@@ -729,7 +823,32 @@ class WaybackDownloader:
                                     return content
                         except:
                             continue
-                
+
+                # Brute-force timeframe scan exhausted. Ask the Wayback CDX
+                # index for the snapshots that actually exist for this URL
+                # and try the ones closest to the run's original timestamp.
+                # This is what lets a partially-archived site come back
+                # together: an asset captured only on a totally different
+                # date than the page that references it still gets pulled.
+                if self.config.auto_search_snapshots:
+                    cdx_timestamps = self._search_snapshots_via_cdx(url)
+                    if cdx_timestamps:
+                        print(
+                            f"         🔎 CDX found {len(cdx_timestamps)} snapshot(s) "
+                            f"for {url[:80]}... — trying closest first",
+                            flush=True,
+                        )
+                        for cdx_ts in cdx_timestamps:
+                            content = self._fetch_at_timestamp(
+                                url, cdx_ts, is_html_page,
+                            )
+                            if content is not None:
+                                print(
+                                    f"         ✓ Recovered via CDX snapshot {cdx_ts}",
+                                    flush=True,
+                                )
+                                return content
+
                 # All Wayback attempts failed - try the original live URL as a
                 # fallback. Only for assets (never HTML pages), and never in
                 # archive_only mode — there the run stays on web.archive.org.

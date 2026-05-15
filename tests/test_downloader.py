@@ -357,3 +357,124 @@ class TestArchiveOnlyMode:
         r.status_code = 302
         r.headers["location"] = "http://example.com/live"
         assert dl.session.get_redirect_target(r) == "http://example.com/live"
+
+
+class TestAutoSearchSnapshots:
+    """Tests for the CDX-backed snapshot auto-search fallback.
+
+    When a URL is gone at the original timestamp AND the brute-force
+    +/- timeframe scan finds nothing, the downloader asks the Wayback
+    CDX index which timestamps actually have a 200 capture of that URL
+    and tries the captures closest to the original timestamp first.
+    """
+
+    def setup_method(self):
+        os.environ["WAYBACK_URL"] = (
+            "https://web.archive.org/web/20200601000000/http://example.com/"
+        )
+        os.environ["ARCHIVE_ONLY"] = "1"  # block live-origin fallback for clarity
+        self.dl = WaybackDownloader(Config())
+
+    def teardown_method(self):
+        os.environ.pop("WAYBACK_URL", None)
+        os.environ.pop("ARCHIVE_ONLY", None)
+        os.environ.pop("AUTO_SEARCH_SNAPSHOTS", None)
+        os.environ.pop("AUTO_SEARCH_SNAPSHOTS_LIMIT", None)
+
+    def test_auto_search_snapshots_default_on(self):
+        os.environ.pop("AUTO_SEARCH_SNAPSHOTS", None)
+        assert Config().auto_search_snapshots is True
+
+    def test_auto_search_snapshots_can_be_disabled(self):
+        os.environ["AUTO_SEARCH_SNAPSHOTS"] = "0"
+        assert Config().auto_search_snapshots is False
+
+    def test_cdx_results_sorted_by_proximity_to_original(self):
+        """The closest captures must be tried first.
+
+        Original timestamp is 2020-06-01. CDX returns four captures, in
+        arbitrary order. We expect them sorted by absolute distance.
+        """
+        cdx_rows = [
+            ["timestamp", "statuscode", "mimetype"],
+            ["20100101000000", "200", "image/png"],   # ~10 years before
+            ["20200701000000", "200", "image/png"],   # ~1 month  after  <- closest
+            ["20250101000000", "200", "image/png"],   # ~4.5 years after
+            ["20200601000000", "200", "image/png"],   # original itself — dropped
+        ]
+        resp = Mock()
+        resp.json = Mock(return_value=cdx_rows)
+        resp.raise_for_status = Mock()
+        with patch.object(self.dl.session, "get", return_value=resp) as mock_get:
+            order = self.dl._search_snapshots_via_cdx("http://example.com/logo.png")
+        # Original timestamp is dropped; remaining sorted closest-first.
+        # 2020-07 is ~1 mo from 2020-06; 2025-01 is ~4.6 yrs; 2010-01 is ~10.4 yrs.
+        assert order == ["20200701000000", "20250101000000", "20100101000000"]
+        # CDX endpoint was actually hit.
+        assert "cdx/search/cdx" in mock_get.call_args.args[0]
+
+    def test_cdx_results_cached_per_url(self):
+        cdx_rows = [["timestamp", "statuscode", "mimetype"],
+                    ["20200701000000", "200", "image/png"]]
+        resp = Mock()
+        resp.json = Mock(return_value=cdx_rows)
+        resp.raise_for_status = Mock()
+        with patch.object(self.dl.session, "get", return_value=resp) as mock_get:
+            self.dl._search_snapshots_via_cdx("http://example.com/logo.png")
+            self.dl._search_snapshots_via_cdx("http://example.com/logo.png")
+        # Second call must be served from cache, no second CDX request.
+        assert mock_get.call_count == 1
+
+    def test_cdx_recovers_asset_after_timeframe_scan_fails(self):
+        """End-to-end: a 404'd asset is recovered via a CDX snapshot."""
+        # Track which Wayback URLs hand back content. The CDX snapshot at
+        # 20200701000000 has the asset; every other Wayback URL 404s.
+        good_wayback = (
+            "https://web.archive.org/web/20200701000000im_/"
+            "http://example.com/logo.png"
+        )
+
+        def _fake_get(url, *a, **kw):
+            if "cdx/search/cdx" in url:
+                r = Mock()
+                r.json = Mock(return_value=[
+                    ["timestamp", "statuscode", "mimetype"],
+                    ["20200701000000", "200", "image/png"],
+                ])
+                r.raise_for_status = Mock()
+                return r
+            if url == good_wayback:
+                r = Mock()
+                r.status_code = 200
+                r.content = b"RECOVERED-PNG-BYTES"
+                r.raise_for_status = Mock()
+                return r
+            # All other Wayback hits behave like a 404.
+            if "web.archive.org" in url:
+                r = Mock()
+                r.status_code = 404
+                err = requests.exceptions.HTTPError(response=r)
+                r.raise_for_status = Mock(side_effect=err)
+                return r
+            # No request should reach the live origin in archive_only mode.
+            raise AssertionError(f"unexpected non-archive request: {url}")
+
+        with patch.object(self.dl.session, "get", side_effect=_fake_get):
+            content = self.dl.download_file("http://example.com/logo.png")
+        assert content == b"RECOVERED-PNG-BYTES"
+
+    def test_cdx_skipped_when_auto_search_disabled(self):
+        os.environ["AUTO_SEARCH_SNAPSHOTS"] = "0"
+        dl = WaybackDownloader(Config())
+
+        def _all_404(url, *a, **kw):
+            if "cdx/search/cdx" in url:
+                raise AssertionError("CDX must not be queried when disabled")
+            r = Mock()
+            r.status_code = 404
+            err = requests.exceptions.HTTPError(response=r)
+            r.raise_for_status = Mock(side_effect=err)
+            return r
+
+        with patch.object(dl.session, "get", side_effect=_all_404):
+            assert dl.download_file("http://example.com/logo.png") is None
