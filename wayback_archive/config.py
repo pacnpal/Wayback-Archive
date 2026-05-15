@@ -92,13 +92,14 @@ class Config:
         # Auto-search snapshots via the Wayback CDX index. When a file is
         # missing at the original timestamp and the brute-force +/- timeframe
         # scan turns up nothing, the downloader queries
-        # web.archive.org/cdx/search/cdx for every successful capture of the
-        # URL and tries the captures closest to the original timestamp.
+        # web.archive.org/cdx/search/cdx for the successful captures
+        # closest to the original timestamp and tries them in order.
         # This is how pieces of a partially-archived site get put back
         # together: an asset that was only captured at a totally different
         # date than the page that references it still gets pulled in.
         # Default on. Set AUTO_SEARCH_SNAPSHOTS=0 to disable and skip the
-        # extra CDX request per miss.
+        # two CDX requests (one windowed before the anchor, one after)
+        # that the downloader issues per uncached missed URL.
         self.auto_search_snapshots: bool = get_bool_env("AUTO_SEARCH_SNAPSHOTS", True)
 
         # How many CDX-discovered candidate timestamps to try per URL before
