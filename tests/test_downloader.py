@@ -2,6 +2,7 @@
 
 import os
 import pytest
+import requests
 from bs4 import BeautifulSoup
 from unittest.mock import Mock, patch, MagicMock
 from wayback_archive.config import Config
@@ -257,3 +258,98 @@ class TestWaybackDownloader:
         # Despite concurrent execution, the font must have been fetched at most once
         assert mock_get.call_count <= 1
 
+
+class TestArchiveOnlyMode:
+    """archive_only mode keeps the downloader on web.archive.org: no
+    live-origin fallback after a Wayback miss, and no chasing a captured
+    redirect whose target leaves the archive."""
+
+    def teardown_method(self):
+        for k in ("WAYBACK_URL", "ARCHIVE_ONLY"):
+            os.environ.pop(k, None)
+
+    def test_config_reads_archive_only_env(self):
+        os.environ["ARCHIVE_ONLY"] = "1"
+        assert Config().archive_only is True
+        os.environ["ARCHIVE_ONLY"] = "0"
+        assert Config().archive_only is False
+        # Default off — the standalone CLI keeps its historical live-fallback
+        # behavior; archive-only is a deliberate opt-in (the dashboard's
+        # default, not the engine's).
+        os.environ.pop("ARCHIVE_ONLY")
+        assert Config().archive_only is False
+
+    @staticmethod
+    def _wayback_404_live_ok(url, *a, **kw):
+        # Every web.archive.org request 404s; the live origin would serve
+        # the asset. Used to prove the flag gates the live fallback.
+        if "web.archive.org" in url:
+            raise requests.exceptions.HTTPError(response=Mock(status_code=404))
+        resp = Mock()
+        resp.content = b"LIVE-BYTES"
+        resp.raise_for_status = Mock()
+        return resp
+
+    @patch("wayback_archive.downloader.requests.Session.get")
+    def test_archive_only_skips_live_origin_fallback(self, mock_get):
+        os.environ["WAYBACK_URL"] = (
+            "https://web.archive.org/web/20200101000000/http://example.com/"
+        )
+        os.environ["ARCHIVE_ONLY"] = "1"
+        mock_get.side_effect = self._wayback_404_live_ok
+        dl = WaybackDownloader(Config())
+        # The asset is gone from Wayback; archive_only must NOT reach for
+        # the live origin, so the result is a clean miss.
+        assert dl.download_file("http://example.com/logo.png") is None
+        # Every request stayed on web.archive.org.
+        assert mock_get.call_count > 0
+        assert all("web.archive.org" in c.args[0]
+                   for c in mock_get.call_args_list)
+
+    @patch("wayback_archive.downloader.requests.Session.get")
+    def test_live_fallback_still_works_when_archive_only_off(self, mock_get):
+        os.environ["WAYBACK_URL"] = (
+            "https://web.archive.org/web/20200101000000/http://example.com/"
+        )
+        os.environ.pop("ARCHIVE_ONLY", None)  # default: off
+        mock_get.side_effect = self._wayback_404_live_ok
+        dl = WaybackDownloader(Config())
+        # Same setup, flag off — the live fallback still recovers the asset,
+        # so the gating in the test above is genuinely the flag's doing.
+        assert dl.download_file("http://example.com/logo.png") == b"LIVE-BYTES"
+
+    def test_archive_only_gates_off_archive_redirects(self):
+        os.environ["WAYBACK_URL"] = (
+            "https://web.archive.org/web/20200101000000/http://example.com/"
+        )
+        os.environ["ARCHIVE_ONLY"] = "1"
+        dl = WaybackDownloader(Config())
+
+        def _resp(location):
+            r = requests.Response()
+            r.url = "https://web.archive.org/web/20200101000000id_/http://example.com/a"
+            r.status_code = 302
+            r.headers["location"] = location
+            return r
+
+        # A captured redirect whose target leaves web.archive.org is dropped.
+        assert dl.session.get_redirect_target(
+            _resp("http://example.com/live-redirect-target")
+        ) is None
+        # A redirect that stays on web.archive.org is still followed.
+        on_archive = "/web/20200101000000id_/http://example.com/b"
+        assert dl.session.get_redirect_target(_resp(on_archive)) == on_archive
+
+    def test_no_redirect_gate_installed_when_archive_only_off(self):
+        os.environ["WAYBACK_URL"] = (
+            "https://web.archive.org/web/20200101000000/http://example.com/"
+        )
+        os.environ.pop("ARCHIVE_ONLY", None)
+        dl = WaybackDownloader(Config())
+        # Off-archive redirect targets pass through untouched when the flag
+        # is off — the gate is only installed in archive_only mode.
+        r = requests.Response()
+        r.url = "https://web.archive.org/web/20200101000000id_/http://example.com/a"
+        r.status_code = 302
+        r.headers["location"] = "http://example.com/live"
+        assert dl.session.get_redirect_target(r) == "http://example.com/live"
