@@ -87,6 +87,8 @@ class WaybackDownloader:
         self._tlocal = threading.local()
         self._file_counter = 0
         self._install_retry_adapter()
+        if self.config.archive_only:
+            self._install_archive_only_gate()
         self._parse_wayback_url()
 
     @property
@@ -142,6 +144,35 @@ class WaybackDownloader:
         )
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+
+    def _install_archive_only_gate(self) -> None:
+        """In archive_only mode, stop the session from following any
+        captured redirect whose target leaves web.archive.org.
+
+        ``id_`` raw playback replays a snapshot's response verbatim, so an
+        old ``302 -> http://<dead-origin>/`` capture would otherwise have
+        ``requests`` chase the long-dead origin host. Returning None from
+        ``get_redirect_target`` tells ``requests`` "this response is not a
+        redirect" and ends the chain at the archive boundary. This — plus
+        the ``archive_only`` guards on the explicit live-origin fallback in
+        ``download_file`` — is the whole of archive-only mode: the
+        downloader never touches a non-web.archive.org host.
+        """
+        orig = getattr(self.session, "get_redirect_target", None)
+        if orig is None:
+            return
+
+        def _gated_redirect_target(resp):
+            target = orig(resp)
+            if target is None:
+                return None
+            try:
+                host = urlparse(urljoin(resp.url or "", target)).hostname or ""
+            except Exception:
+                return None
+            return target if host == "web.archive.org" else None
+
+        self.session.get_redirect_target = _gated_redirect_target  # type: ignore[assignment]
 
     def _parse_wayback_url(self):
         """Parse the Wayback Machine URL to extract the original URL."""
@@ -699,8 +730,10 @@ class WaybackDownloader:
                         except:
                             continue
                 
-                # All Wayback attempts failed - try original live URL as fallback (only for assets, not HTML pages)
-                if not is_html_page:
+                # All Wayback attempts failed - try the original live URL as a
+                # fallback. Only for assets (never HTML pages), and never in
+                # archive_only mode — there the run stays on web.archive.org.
+                if not is_html_page and not self.config.archive_only:
                     try:
                         print(f"         🔄 Wayback failed, trying original URL: {url[:80]}...", flush=True)
                         live_response = self.session.get(
@@ -726,8 +759,9 @@ class WaybackDownloader:
                         pass
             # Other HTTP errors - skip silently
         except requests.exceptions.Timeout:
-            # Timeout on Wayback - try original URL as fallback (only for assets)
-            if not is_html_page:
+            # Timeout on Wayback - try the original live URL as a fallback.
+            # Only for assets, and never in archive_only mode.
+            if not is_html_page and not self.config.archive_only:
                 try:
                     print(f"         🔄 Wayback timeout, trying original URL: {url[:80]}...", flush=True)
                     live_response = self.session.get(
