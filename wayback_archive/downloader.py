@@ -72,12 +72,17 @@ class WaybackDownloader:
         )
         # Track corrupted font files (HTML error pages instead of actual fonts)
         self.corrupted_fonts: Set[str] = set()
+        # Track font URLs that have already been pre-checked for corruption
+        # (whether corrupted or not) so _check_and_remove_corrupted_fonts_in_css
+        # never re-downloads the same URL when multiple CSS files reference it.
+        self._font_prefetch_checked: Set[str] = set()
         # Concurrency primitives. `_lock` guards the crawl's shared mutable
         # state (config.visited_urls, config.downloaded_files,
-        # corrupted_fonts, the file counter and the run stats). `_tlocal`
-        # holds per-worker page context — see `_current_page_url` usage —
-        # so concurrent HTML pages don't clobber each other's relative-path
-        # base. Both are harmless no-ops in the single-worker case.
+        # corrupted_fonts, _font_prefetch_checked, the file counter and the
+        # run stats). `_tlocal` holds per-worker page context — see
+        # `_current_page_url` usage — so concurrent HTML pages don't clobber
+        # each other's relative-path base. Both are harmless no-ops in the
+        # single-worker case.
         self._lock = threading.Lock()
         self._tlocal = threading.local()
         self._file_counter = 0
@@ -805,6 +810,13 @@ class WaybackDownloader:
         
         This checks font files referenced in CSS to see if they're HTML error pages,
         even before they're queued for download.
+
+        Each unique font URL is fetched at most once across all CSS files: after the
+        first pre-check (corrupted or not) the normalized URL is recorded in
+        ``self._font_prefetch_checked`` so subsequent CSS files that reference the
+        same font skip the redundant download.  Without this guard the same large
+        font/SVG file could be re-downloaded once per CSS file that mentions it —
+        producing the "same file status=ok 5-6×" pattern.
         """
         # Find all font URLs in CSS
         font_url_pattern = r'url\s*\(\s*["\']?([^"\']*\.(?:woff|woff2|ttf|eot|otf|svg))["\']?\s*\)'
@@ -824,11 +836,19 @@ class WaybackDownloader:
             # Normalize URL
             normalized_font_url = self._normalize_url(font_url, base_url)
             
-            # Skip if already in corrupted set
-            if normalized_font_url in self.corrupted_fonts:
+            # Skip if already in corrupted set OR already pre-checked (thread-safe).
+            # Both sets are guarded by _lock so workers can't race past this check.
+            with self._lock:
+                already_handled = (
+                    normalized_font_url in self.corrupted_fonts
+                    or normalized_font_url in self._font_prefetch_checked
+                )
+            if already_handled:
                 continue
             
-            # Try to download and check if corrupted (with quick timeout)
+            # Try to download and check if corrupted (with quick timeout).
+            # Always mark as pre-checked afterwards — even on network failure —
+            # so later CSS files don't retry the same URL.
             try:
                 wayback_url = self._convert_to_wayback_url_with_timestamp(font_url)
                 response = self.session.get(wayback_url, timeout=5, allow_redirects=True)
@@ -836,10 +856,14 @@ class WaybackDownloader:
                     if self._is_corrupted_font(response.content, font_url):
                         self._mark_corrupted_font(normalized_font_url)
                         print(f"         ⚠️  Detected corrupted font in CSS: {os.path.basename(font_url)}", flush=True)
-            except Exception as e:
+            except Exception:
                 # If we can't check, skip - it will be checked when actually downloaded
                 # Don't print errors here to avoid spam
                 pass
+            finally:
+                # Record that this URL has been pre-checked, regardless of outcome.
+                with self._lock:
+                    self._font_prefetch_checked.add(normalized_font_url)
         
         return css
     

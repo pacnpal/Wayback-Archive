@@ -185,3 +185,35 @@ class TestWaybackDownloader:
         # The background image must be queued for download
         assert "http://example.com/background.gif" in links_to_follow
 
+    @patch("wayback_archive.downloader.requests.Session.get")
+    def test_font_prefetch_checked_only_once_across_multiple_css_files(self, mock_get):
+        """Each font URL is pre-checked at most once, even when multiple CSS files
+        reference the same font.
+
+        Regression test: _check_and_remove_corrupted_fonts_in_css used to re-download
+        the same font once per CSS file that referenced it, producing the same large
+        file with status=ok 5-6× in a single run.
+        """
+        # Simulate a non-corrupted font response (valid woff2 header bytes)
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.content = b"\x00\x01\x00\x00" * 100  # binary, not HTML
+        mock_get.return_value = mock_response
+
+        font_url = "http://example.com/fonts/my-font.woff2"
+
+        # Three CSS files all reference the same font
+        css_template = f"@font-face {{ src: url('{font_url}') format('woff2'); }}"
+        base_url = "http://example.com/css/style.css"
+
+        self.downloader._check_and_remove_corrupted_fonts_in_css(css_template, base_url)
+        self.downloader._check_and_remove_corrupted_fonts_in_css(css_template, base_url)
+        self.downloader._check_and_remove_corrupted_fonts_in_css(css_template, base_url)
+
+        # The font should have been fetched exactly once, not three times
+        assert mock_get.call_count == 1
+
+        # The font URL should be recorded in the pre-checked set
+        normalized = self.downloader._normalize_url(font_url, base_url)
+        assert normalized in self.downloader._font_prefetch_checked
+
