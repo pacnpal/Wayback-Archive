@@ -339,6 +339,10 @@ class TestArchiveOnlyMode:
         # A redirect that stays on web.archive.org is still followed.
         on_archive = "/web/20200101000000id_/http://example.com/b"
         assert dl.session.get_redirect_target(_resp(on_archive)) == on_archive
+        # Hostname comparison is case-insensitive (RFC 4343) — an uppercase
+        # archive host must still be recognized as on-archive.
+        upper = "https://WEB.ARCHIVE.ORG/web/20200101000000id_/http://example.com/c"
+        assert dl.session.get_redirect_target(_resp(upper)) == upper
 
     def test_no_redirect_gate_installed_when_archive_only_off(self):
         os.environ["WAYBACK_URL"] = (
