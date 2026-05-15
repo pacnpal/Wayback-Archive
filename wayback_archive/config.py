@@ -79,6 +79,16 @@ class Config:
         else:
             self.workers: int = 1
 
+        # Archive-only mode. When set, the downloader never touches a
+        # non-web.archive.org host: it skips the live-origin fallback that
+        # download_file() would otherwise try after every Wayback miss, and
+        # it drops any captured redirect whose target leaves web.archive.org.
+        # Default False keeps the standalone CLI's historical behavior (live
+        # fallback on); the dashboard sets ARCHIVE_ONLY=1 by default so a
+        # crawl of a long-dead host never fans requests out to origins that
+        # haven't existed in decades.
+        self.archive_only: bool = get_bool_env("ARCHIVE_ONLY", False)
+
         # Internal state
         self.base_url: Optional[str] = None
         self.domain: Optional[str] = None
