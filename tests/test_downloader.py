@@ -422,8 +422,80 @@ class TestAutoSearchSnapshots:
         with patch.object(self.dl.session, "get", return_value=resp) as mock_get:
             self.dl._search_snapshots_via_cdx("http://example.com/logo.png")
             self.dl._search_snapshots_via_cdx("http://example.com/logo.png")
-        # Second call must be served from cache, no second CDX request.
-        assert mock_get.call_count == 1
+        # First lookup issues two windowed CDX queries (before + after the
+        # original timestamp); the second lookup is served from cache and
+        # makes no further requests.
+        assert mock_get.call_count == 2
+
+    def test_cdx_uses_windowed_queries_around_anchor(self):
+        """CDX must NOT use a single ``limit=N`` query.
+
+        A single ``limit=N`` returns the chronologically EARLIEST N
+        captures — for a heavily-archived URL whose captures all sit far
+        from the run's anchor, that produces zero useful candidates. The
+        downloader instead anchors two windowed queries around the
+        original timestamp so the merged set is always near the anchor.
+        """
+        captured: list[str] = []
+
+        def _fake_get(url, *a, **kw):
+            captured.append(url)
+            r = Mock()
+            r.json = Mock(return_value=[["timestamp", "statuscode", "mimetype"]])
+            r.raise_for_status = Mock()
+            return r
+
+        with patch.object(self.dl.session, "get", side_effect=_fake_get):
+            self.dl._search_snapshots_via_cdx("http://example.com/logo.png")
+        anchor = "20200601000000"
+        # Two queries, anchored on the original timestamp: one ending at
+        # the anchor (with limit=-N, the N captures just BEFORE) and one
+        # starting at the anchor (limit=N, the N just AFTER).
+        assert len(captured) == 2
+        joined = " ".join(captured)
+        assert f"to={anchor}" in joined and "limit=-" in joined
+        assert f"from={anchor}" in joined
+        # Crucially: no unbounded ``limit=N`` query without a window,
+        # which is what the original code had and what the review flagged.
+        for u in captured:
+            assert ("from=" in u) or ("to=" in u), u
+
+    def test_cdx_transient_failure_does_not_poison_cache(self):
+        """If CDX is briefly unreachable, the URL must be retryable.
+
+        Caching ``[]`` on every exception (which the first version of
+        this code did) would permanently mark the URL as snapshot-less
+        for the rest of the crawl — a 503/429 from CDX would silently
+        defeat the whole feature. Only successful responses get cached.
+        """
+        call_count = {"n": 0}
+
+        def _fake_get(url, *a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First lookup: CDX query times out (the helper catches
+                # the exception and bails after the first failure).
+                raise requests.exceptions.Timeout("CDX down")
+            # Subsequent calls: CDX is back.
+            r = Mock()
+            r.json = Mock(return_value=[
+                ["timestamp", "statuscode", "mimetype"],
+                ["20200701000000", "200", "image/png"],
+            ])
+            r.raise_for_status = Mock()
+            return r
+
+        with patch.object(self.dl.session, "get", side_effect=_fake_get):
+            first = self.dl._search_snapshots_via_cdx(
+                "http://example.com/logo.png"
+            )
+            assert first == []
+            # Same URL, asked again — must not be served from a poisoned
+            # cache entry; CDX gets re-queried and now succeeds.
+            second = self.dl._search_snapshots_via_cdx(
+                "http://example.com/logo.png"
+            )
+            assert second == ["20200701000000"]
 
     def test_cdx_recovers_asset_after_timeframe_scan_fails(self):
         """End-to-end: a 404'd asset is recovered via a CDX snapshot."""
