@@ -167,7 +167,7 @@ class WaybackDownloader:
             if target is None:
                 return None
             try:
-                host = urlparse(urljoin(resp.url or "", target)).hostname or ""
+                host = (urlparse(urljoin(resp.url or "", target)).hostname or "").lower()
             except Exception:
                 return None
             return target if host == "web.archive.org" else None
