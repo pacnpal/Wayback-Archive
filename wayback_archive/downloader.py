@@ -572,9 +572,25 @@ class WaybackDownloader:
         """Convert absolute URL to relative path."""
         parsed = urlparse(url)
         path = parsed.path or "/"
+        # Mirror `_get_relative_link_path`'s query-suffix logic: when
+        # the flag is on, the file on disk is renamed with `.q-<hash>`
+        # in the stem and NO `?query` tail. The href must match — used
+        # by non-stylesheet <link> rewrites and other paths that don't
+        # go through `_get_relative_link_path`. Without this, preload
+        # / icon / prefetch / shortcut links with query-bearing hrefs
+        # 404 even though the asset was successfully downloaded.
         suffix = ""
         if parsed.query:
-            suffix += "?" + parsed.query
+            if self.config.query_string_suffix:
+                from wayback_archive.query_hash import suffix_for_query
+                qhash = suffix_for_query(parsed.query)
+                stem, dot, ext = path.rpartition(".")
+                if dot and "/" not in ext:
+                    path = f"{stem}{qhash}.{ext}"
+                else:
+                    path = path + qhash
+            else:
+                suffix += "?" + parsed.query
         if parsed.fragment:
             suffix += "#" + parsed.fragment
         return self._to_relative_path(path) + suffix
@@ -3161,9 +3177,12 @@ def _default_urlopen(req, timeout=15):
 
 _QUERY_HASH_SUFFIX_RE = re.compile(r"\.q-[0-9a-f]{8}(?=\.[^.]+$|$)")
 # Hostname-segment sniff: at least one dot, doesn't start with one, and
-# ends in a 2-6 letter TLD-ish suffix. Rejects directory names that just
-# happen to contain a dot — `.well-known`, `v1.2`, `node_modules`, etc.
-_HOSTNAME_SEG_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]+\.[A-Za-z]{2,6}$")
+# ends in a 2+ char alphabetic TLD. The 2-char min rejects version-style
+# directory names (`v1.2` → TLD `2` fails); the all-alpha requirement
+# rejects numeric TLDs (`v1.2.3` → TLD `3` fails). No upper bound on TLD
+# length so long modern TLDs (`.technology`, `.engineering`,
+# `.international`, etc.) match.
+_HOSTNAME_SEG_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]+\.[A-Za-z]{2,}$")
 
 
 def _orig_url_from_rel(

@@ -94,6 +94,19 @@ class TestWaybackDownloader:
         assert expected_hash in href
         assert "?v=1" not in href
 
+    def test_make_relative_path_uses_query_hash_when_suffix_on(self):
+        """`_make_relative_path` (used by non-stylesheet <link> rewrites
+        for preload/icon/prefetch) must produce the same `.q-<hash>`
+        filename as `_get_local_path` so the rewritten href matches the
+        saved file."""
+        self.config.query_string_suffix = True
+        from wayback_archive.query_hash import suffix_for_query
+        href = self.downloader._make_relative_path("http://example.com/font.woff2?v=1")
+        expected = suffix_for_query("v=1")
+        assert expected in href
+        assert "?v=1" not in href
+        assert href.endswith(".woff2")
+
     def test_query_in_link_preserved_when_suffix_off(self):
         """With the flag off, the href keeps `?query` (historical
         behavior)."""

@@ -218,6 +218,30 @@ def test_cross_origin_rel_routes_to_correct_host_https(cfg, monkeypatch):
     assert "https://images.squarespace-cdn.com/content/x.jpg" in fetched
 
 
+def test_long_tld_hosts_are_recognized(cfg, monkeypatch):
+    """Modern long TLDs (.technology, .engineering, .international, etc.)
+    must match the hostname heuristic — capping at 6 chars excluded them."""
+    dl = WaybackDownloader(cfg)
+    fetched = []
+
+    def fake_download(self, url):
+        fetched.append(url)
+        return b"bytes"
+
+    monkeypatch.setattr(WaybackDownloader, "download_file", fake_download)
+    dl.repair(
+        [
+            "cdn.example.technology/app.js",
+            "api.foo.international/endpoint",
+            "x.bar.engineering/style.css",
+        ],
+        workers=1,
+    )
+    assert "https://cdn.example.technology/app.js" in fetched
+    assert "https://api.foo.international/endpoint" in fetched
+    assert "https://x.bar.engineering/style.css" in fetched
+
+
 def test_well_known_path_is_not_treated_as_hostname(cfg, monkeypatch):
     """`.well-known/security.txt` is a legitimate path under the primary
     host — must NOT be treated as hostname `.well-known`."""
