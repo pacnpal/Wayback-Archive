@@ -30,8 +30,9 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:
-    """Serialize `obj` to JSON and write it to `path` atomically. Parent
-    must exist; mirrors the dashboard's sidecar-writer behavior."""
+    """Serialize `obj` to JSON and write it to `path` atomically. Creates
+    parent dirs if missing, matching `atomic_write_bytes`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w") as f:

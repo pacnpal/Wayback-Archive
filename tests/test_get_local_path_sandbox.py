@@ -36,19 +36,20 @@ def test_no_query_no_suffix(dl):
     assert ".q-" not in p.name
 
 
-def test_resolved_path_escape_raises(dl, tmp_path):
-    # urlparse may strip leading dots — use raw construction to test the
-    # general escape behavior. Inject by making config.output_dir a
-    # subdir and constructing a URL whose path tries to escape via /..
-    # The standard `_get_local_path` strips leading /, but resolve()
-    # will still escape via embedded ..
-    # This is somewhat artifact-dependent; the simpler test is that
-    # paths INSIDE output_dir are accepted.
+def test_resolved_path_escape_raises(dl):
+    # A URL whose path resolves outside output_dir (via embedded .. that
+    # survives urlparse) must raise rather than write somewhere random.
+    with pytest.raises(ValueError):
+        dl._get_local_path("http://x.com/a/../../escape.png")
+
+
+def test_resolved_path_inside_output_dir_ok(dl, tmp_path):
     p = dl._get_local_path("http://x.com/sub/dir/a.png")
     assert str(p).startswith(str(tmp_path.resolve()))
 
 
 def test_sandbox_off_allows_relative_path(tmp_path, monkeypatch):
+    from pathlib import Path
     monkeypatch.setenv("WAYBACK_URL", "https://web.archive.org/web/20240101000000/http://x.com/")
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))
     cfg = Config()
@@ -57,7 +58,7 @@ def test_sandbox_off_allows_relative_path(tmp_path, monkeypatch):
     # With the gate off, a netloc-less URL still computes a path (the
     # standalone CLI's historical behavior); we just don't crash.
     p = dl._get_local_path("/foo/bar.png")
-    assert isinstance(str(p), str)
+    assert isinstance(p, Path)
 
 
 def test_query_suffix_off_keeps_clean_filename(tmp_path, monkeypatch):

@@ -114,14 +114,20 @@ def raw_fetch(
     302 to a long-dead origin should not be chased.
 
     The ``on_response(response, request_url)`` hook (if supplied) is
-    invoked once per successful HTTP exchange — including non-200s the
-    caller might want to observe (429s, 502s, 403/451). It must not
-    raise. Exceptions inside the hook are swallowed and logged.
+    invoked exactly once per HTTP exchange, including each intermediate
+    redirect hop within the archive — so a policy caller can observe a
+    429 or cascade-502 that happens mid-chain. The hook is also called
+    with ``response=None`` on transport exceptions so the caller can
+    drain any thread-local proxy attribution before the
+    ``TransientCDXError`` propagates. It must not raise; exceptions
+    inside the hook are swallowed and logged.
     """
     wb = f"https://web.archive.org/web/{ts}id_/{url}"
+    current_url = wb
     try:
-        current_url = wb
         r = session.get(current_url, timeout=timeout, allow_redirects=False)
+        if on_response is not None:
+            _safe_call(on_response, r, current_url)
         hops = 0
         while r.status_code in (301, 302, 303, 307, 308) and hops < 5:
             loc = r.headers.get("Location", "") if r.headers else ""
@@ -129,14 +135,12 @@ def raw_fetch(
                 break
             nxt = urllib.parse.urljoin(current_url, loc)
             if urllib.parse.urlparse(nxt).hostname != "web.archive.org":
-                if on_response is not None:
-                    _safe_call(on_response, r, wb)
                 return None
             hops += 1
             current_url = nxt
             r = session.get(current_url, timeout=timeout, allow_redirects=False)
-        if on_response is not None:
-            _safe_call(on_response, r, wb)
+            if on_response is not None:
+                _safe_call(on_response, r, current_url)
         if r.status_code == 429:
             raise TransientCDXError(f"rate limited (429): {wb}")
         if r.status_code == 200 and r.content:
@@ -145,7 +149,7 @@ def raw_fetch(
         raise
     except Exception as e:
         if on_response is not None:
-            _safe_call(on_response, None, wb)
+            _safe_call(on_response, None, current_url)
         log.debug("raw_fetch error url=%s err=%s", wb, e, exc_info=True)
         raise TransientCDXError(f"raw fetch transport error: {wb}") from e
     return None

@@ -117,29 +117,40 @@ class Config:
             self.auto_search_snapshots_limit: int = 30
 
         # --- Wayback-quirk handling (absorbed from the dashboard's resume
-        # shim). Off by default to preserve the historical standalone-CLI
-        # behavior; the dashboard flips them on.
+        # shim). Default ON — these are correctness/UX improvements every
+        # Wayback consumer benefits from. Set the corresponding env var
+        # (or set the Config attribute) to a falsy value to opt out per
+        # job.
         # `resume_from_disk`: on `download_file`, serve from disk if the
         # file already exists (and isn't an HTML-error masquerade).
         # Job-level resume for crashed/retried runs.
-        self.resume_from_disk: bool = get_bool_env("RESUME_FROM_DISK", False)
+        self.resume_from_disk: bool = get_bool_env("RESUME_FROM_DISK", True)
         # `sandbox_local_paths`: refuse URLs without a netloc and clamp
         # every computed local path inside `output_dir`. Prevents the
         # leak-to-mount-root bug where an un-absolutized relative URL got
         # written to the filesystem root.
-        self.sandbox_local_paths: bool = get_bool_env("SANDBOX_LOCAL_PATHS", False)
+        self.sandbox_local_paths: bool = get_bool_env("SANDBOX_LOCAL_PATHS", True)
         # `query_string_suffix`: splice `.q-<sha1[:8]>` into the filename
         # stem so same-path different-query URLs (foo.png?v=1 / foo.png?v=2)
-        # don't collide on disk.
-        self.query_string_suffix: bool = get_bool_env("QUERY_STRING_SUFFIX", False)
-        # `purge_partial_on_start`: scan the output-dir log on init for an
-        # incomplete last-step line; remove its target file so a retried
-        # run doesn't see a half-written asset and skip refetching.
+        # don't collide on disk. NOTE: the crawl's visited-URL dedupe
+        # (`_norm_track`) checks `query_string_suffix` and keeps the
+        # query in its visit-tracking key when this flag is on, so both
+        # variants reach the fetch path.
+        self.query_string_suffix: bool = get_bool_env("QUERY_STRING_SUFFIX", True)
+        # `purge_partial_on_start`: scan the output-dir's `.log` on init
+        # for an incomplete last-step line; remove its target file so a
+        # retried run doesn't see a half-written asset and skip
+        # refetching. Default OFF — `.log` is a dashboard-specific
+        # convention; the standalone CLI doesn't write one.
         self.purge_partial_on_start: bool = get_bool_env("PURGE_PARTIAL_ON_START", False)
         # `playwright_redirect_stub`: wrap session.get so off-archive
         # redirects synthesize a tiny meta-refresh stub at the
         # pre-redirect local path. Lets cross-path internal links resolve
         # locally even when Wayback bounced through an old origin URL.
+        # Default OFF — meta-refresh stubs only matter when an HTML
+        # viewer reads the snapshot directly (the dashboard's case).
+        # Captures session.get at init so test suites that patch
+        # Session.get post-init want this off.
         self.playwright_redirect_stub: bool = get_bool_env("PLAYWRIGHT_REDIRECT_STUB", False)
         # `reject_html_masquerade`: on every download_file success, sniff
         # the body against the URL's extension. If a `.gif`/`.png`/etc.

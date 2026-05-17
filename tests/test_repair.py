@@ -23,8 +23,9 @@ def cfg(tmp_path, monkeypatch):
 def _make_resp(status, content=b""):
     class _R:
         status_code = status
-        def __init__(self): self.content = content
-        headers = {}
+        def __init__(self):
+            self.content = content
+            self.headers = {}
     return _R()
 
 

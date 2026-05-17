@@ -161,6 +161,19 @@ class WaybackDownloader:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
+    def _timed_get(self, *args, **kwargs):
+        """Wrapper around `self.session.get` that records the network call
+        time into the per-instance metrics counters. Use this everywhere
+        in `download_file` (primary fetch, if_ HTML fetch, timestamp
+        retries via `_fetch_at_timestamp`, CDX recovery, live-origin
+        fallback) so `snapshot_metrics()` reflects real activity.
+        """
+        t0 = time.monotonic()
+        try:
+            return self.session.get(*args, **kwargs)
+        finally:
+            self._record_network_call((time.monotonic() - t0) * 1000.0)
+
     def _install_archive_only_gate(self) -> None:
         """In archive_only mode, stop the session from following any
         captured redirect whose target leaves web.archive.org.
@@ -277,7 +290,11 @@ class WaybackDownloader:
                 netloc = netloc[4:]
             if not netloc:
                 return
-            normalized = parsed._replace(netloc=netloc, fragment="", query="").geturl()
+            # Preserve the query string: when `query_string_suffix` is on,
+            # `_get_local_path` splices a query-hash into the filename, so
+            # stripping the query here would look up the wrong path and
+            # leave the partial file in place.
+            normalized = parsed._replace(netloc=netloc, fragment="").geturl()
             local_path = self._get_local_path(normalized)
             if local_path.is_file():
                 local_path.unlink()
@@ -331,11 +348,16 @@ class WaybackDownloader:
                     if pre_path == post_path or pre_path.exists():
                         continue
                     try:
-                        from posixpath import relpath as _relpath
-                        rel = _relpath(
+                        # Compute as a filesystem path with os.path.relpath
+                        # (POSIX) then normalize to URL separators. Using
+                        # str(Path) directly would produce backslashes on
+                        # Windows and break the meta-refresh URL.
+                        import os.path as _ospath
+                        fs_rel = _ospath.relpath(
                             str(post_path),
                             str(pre_path.parent) or ".",
                         )
+                        rel = fs_rel.replace(os.sep, "/")
                     except Exception:
                         continue
                     stub = (
@@ -343,8 +365,8 @@ class WaybackDownloader:
                         f'content="0; url={rel}"><title>Redirect</title>\n'
                     )
                     try:
-                        pre_path.parent.mkdir(parents=True, exist_ok=True)
-                        pre_path.write_text(stub, encoding="utf-8")
+                        from wayback_archive.io_atomic import atomic_write_bytes
+                        atomic_write_bytes(pre_path, stub.encode("utf-8"))
                     except Exception:
                         pass
             except Exception:
@@ -356,77 +378,30 @@ class WaybackDownloader:
 
     def _install_playwright_render(self) -> None:
         """When `USE_PLAYWRIGHT=1` and the `playwright` package is
-        importable, wrap `download_file` so HTML pages are rendered
-        through a single dedicated render thread before extraction.
+        importable, wrap this instance's `download_file` so HTML pages
+        are rendered through a single process-wide render thread before
+        extraction.
 
-        Lifted from the dashboard resume shim's `_patch_playwright`. The
-        render thread owns the one Playwright instance for its life;
-        worker threads hand it HTML over a queue and block for the result.
+        The render thread + Chromium browser are a *process-level
+        singleton* (module-state `_PLAYWRIGHT_RENDER_Q` / `_THREAD`):
+        every WaybackDownloader instance constructed in this process
+        shares them. This matters because `repair()` spins up one
+        WaybackDownloader per worker thread; without the singleton,
+        a 4-worker repair job would spawn 4 browsers and 4 render
+        threads. The first instance that opts in starts the singleton;
+        subsequent ones reuse it.
         """
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright  # noqa: F401
         except ImportError:
             return
 
-        import atexit
-        import queue as _queue
         from concurrent.futures import Future
         from wayback_archive.playback import url_ext as _url_ext
 
-        _SHUTDOWN = object()
-        _render_q: "_queue.Queue" = _queue.Queue()
-
-        def _render_loop():
-            pw = browser = ctx = None
-            try:
-                while True:
-                    item = _render_q.get()
-                    if item is _SHUTDOWN:
-                        return
-                    html, fut = item
-                    try:
-                        if ctx is None:
-                            pw = sync_playwright().start()
-                            browser = pw.chromium.launch(
-                                headless=True,
-                                args=["--no-sandbox", "--disable-dev-shm-usage"],
-                            )
-                            ctx = browser.new_context(
-                                user_agent="Mozilla/5.0 Wayback-Archive/Playwright",
-                                ignore_https_errors=True,
-                            )
-                        page = ctx.new_page()
-                        try:
-                            page.set_content(
-                                html, wait_until="networkidle", timeout=15000,
-                            )
-                            rendered = page.content()
-                        finally:
-                            page.close()
-                        fut.set_result(rendered)
-                    except Exception:
-                        fut.set_result(None)
-            finally:
-                for closer in (
-                    lambda: ctx and ctx.close(),
-                    lambda: browser and browser.close(),
-                    lambda: pw and pw.stop(),
-                ):
-                    try:
-                        closer()
-                    except Exception:
-                        pass
-
-        _render_thread = threading.Thread(
-            target=_render_loop, name="wa-playwright-render", daemon=True,
-        )
-        _render_thread.start()
-
-        def _shutdown_render():
-            _render_q.put(_SHUTDOWN)
-            _render_thread.join(timeout=10)
-
-        atexit.register(_shutdown_render)
+        _render_q = _ensure_playwright_singleton()
+        if _render_q is None:  # singleton failed to start
+            return
 
         _current_download = self.download_file
 
@@ -711,8 +686,10 @@ class WaybackDownloader:
             # Remove leading slashes
             while domain_path.startswith("/"):
                 domain_path = domain_path[1:]
-            return Path(self.config.output_dir) / domain_path
-        
+            return self._apply_path_flags(
+                Path(self.config.output_dir) / domain_path, parsed,
+            )
+
         # Special handling for Squarespace CDN - preserve domain structure
         # This prevents CDN root URLs from overwriting index.html
         if self._is_squarespace_cdn(url):
@@ -723,7 +700,9 @@ class WaybackDownloader:
             # If no path, add index.html under the domain folder
             if not parsed.path or parsed.path == "/":
                 domain_path = f"{parsed.netloc}/index.html"
-            return Path(self.config.output_dir) / domain_path
+            return self._apply_path_flags(
+                Path(self.config.output_dir) / domain_path, parsed,
+            )
         
         path = unquote(parsed.path)
         
@@ -763,7 +742,18 @@ class WaybackDownloader:
             else:
                 path = base_part + ".html"
 
-        local = Path(self.config.output_dir) / path
+        return self._apply_path_flags(
+            Path(self.config.output_dir) / path, parsed,
+        )
+
+    def _apply_path_flags(self, local: Path, parsed) -> Path:
+        """Common post-processing for `_get_local_path`'s three return
+        branches (Google Fonts, Squarespace, generic): splice the
+        query-hash suffix into the stem if `query_string_suffix` is on,
+        then sandbox-clamp inside `output_dir` if `sandbox_local_paths`
+        is on. Centralizing this keeps the special-case branches from
+        skipping the sandbox check — that was a path-traversal hole
+        when CDN URLs contained `..` segments."""
         if self.config.query_string_suffix and parsed.query:
             from wayback_archive.query_hash import suffix_for_query
             suffix = suffix_for_query(parsed.query)
@@ -968,7 +958,7 @@ class WaybackDownloader:
             wayback_url = self._convert_to_wayback_url_with_timestamp(
                 url, timestamp, use_iframe=is_html_page,
             )
-            response = self.session.get(wayback_url, timeout=timeout,
+            response = self._timed_get(wayback_url, timeout=timeout,
                                         allow_redirects=True)
             if response.status_code != 200:
                 return None
@@ -1096,7 +1086,7 @@ class WaybackDownloader:
         if is_html_page:
             wayback_url_if = self._convert_to_wayback_url_with_timestamp(url, use_iframe=True)
             try:
-                response = self.session.get(
+                response = self._timed_get(
                     wayback_url_if, timeout=15, allow_redirects=True
                 )
                 response.raise_for_status()
@@ -1129,12 +1119,10 @@ class WaybackDownloader:
         
         # Try original timestamp first (or fallback from if_)
         wayback_url = self._convert_to_wayback_url_with_timestamp(url)
-        _t0 = time.monotonic()
         try:
-            response = self.session.get(
+            response = self._timed_get(
                 wayback_url, timeout=15, allow_redirects=True
             )
-            self._record_network_call((time.monotonic() - _t0) * 1000.0)
             response.raise_for_status()
             content = response.content
 
@@ -1206,7 +1194,7 @@ class WaybackDownloader:
                 if not is_html_page and not self.config.archive_only:
                     try:
                         print(f"         🔄 Wayback failed, trying original URL: {url[:80]}...", flush=True)
-                        live_response = self.session.get(
+                        live_response = self._timed_get(
                             url, timeout=10, allow_redirects=True
                         )
                         live_response.raise_for_status()
@@ -1234,7 +1222,7 @@ class WaybackDownloader:
             if not is_html_page and not self.config.archive_only:
                 try:
                     print(f"         🔄 Wayback timeout, trying original URL: {url[:80]}...", flush=True)
-                    live_response = self.session.get(
+                    live_response = self._timed_get(
                         url, timeout=10, allow_redirects=True
                     )
                     live_response.raise_for_status()
@@ -2453,16 +2441,24 @@ class WaybackDownloader:
 
         return processed_html, links_to_follow
 
-    @staticmethod
-    def _norm_track(url: str) -> str:
+    def _norm_track(self, url: str) -> str:
         """Normalization key for the visited-set: lowercased netloc with a
-        leading ``www.`` stripped, and no fragment or query. Matches the
-        historical sequential loop's dedup so resume/visited semantics are
-        unchanged by the move to a concurrent crawl."""
+        leading ``www.`` stripped, no fragment, and no query by default.
+        Matches the historical sequential loop's dedup so resume/visited
+        semantics are unchanged by the move to a concurrent crawl.
+
+        When `Config.query_string_suffix` is on, the query string is
+        kept in the tracking key so `foo.png?v=1` and `foo.png?v=2`
+        stay distinct (they otherwise collapse into a single fetch
+        before the suffix-splicing in `_get_local_path` ever sees the
+        second variant, neutralizing the on-disk disambiguation).
+        """
         parsed = urlparse(url)
         netloc = parsed.netloc.lower()
         if netloc.startswith("www."):
             netloc = netloc[4:]
+        if self.config.query_string_suffix:
+            return parsed._replace(netloc=netloc, fragment="").geturl()
         return parsed._replace(netloc=netloc, fragment="", query="").geturl()
 
     def _mark_corrupted_font(self, url: str) -> None:
@@ -2993,18 +2989,8 @@ class WaybackDownloader:
                     except OSError:
                         head = b""
                     if head and not looks_like_html_error(head, ext):
-                        result.status = "ok"
+                        result.status = "skip"
                         result.bytes_written = local.stat().st_size
-                        # `skipped` is signaled via `from_fallback=False`
-                        # and `bytes_written>0`; the summary aggregator
-                        # uses a separate skipped counter below.
-                        result.tried_alts = 0
-                        result.unrecoverable = False
-                        # Mark via a sentinel: status="ok" with used_ts==None
-                        # AND from_fallback=False AND no actual fetch.
-                        # We'll distinguish in the aggregator via an
-                        # `_already_present` attribute.
-                        result._already_present = True  # type: ignore[attr-defined]
                         return result
 
                 # Primary fetch.
@@ -3090,12 +3076,9 @@ class WaybackDownloader:
             for fut in as_completed(futures):
                 r = fut.result()
                 if r.status == "ok":
-                    if getattr(r, "_already_present", False):
-                        skipped += 1
-                    else:
-                        ok += 1
-                        if r.from_fallback:
-                            fallback_hits += 1
+                    ok += 1
+                    if r.from_fallback:
+                        fallback_hits += 1
                 elif r.status == "fail":
                     failed += 1
                     if r.unrecoverable:
@@ -3121,3 +3104,89 @@ def _default_urlopen(req, timeout=15):
     callable is picklable / replaceable from outside tests."""
     import urllib.request
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+# --- Playwright render-thread singleton (one per process) -------------
+#
+# `_install_playwright_render` on each WaybackDownloader instance dispatches
+# through these shared module-level objects so that 4 worker threads in
+# `repair()` don't spawn 4 separate Chromium processes. The thread + the
+# Playwright/browser/context it owns are created lazily on the first
+# render request and torn down once at process exit.
+
+_PLAYWRIGHT_LOCK = threading.Lock()
+_PLAYWRIGHT_RENDER_Q = None  # type: Optional[queue.Queue]
+_PLAYWRIGHT_THREAD = None  # type: Optional[threading.Thread]
+_PLAYWRIGHT_SHUTDOWN = object()
+
+
+def _ensure_playwright_singleton():
+    """Return the process-wide render queue, starting the render thread on
+    first call. Returns None if Playwright fails to import."""
+    global _PLAYWRIGHT_RENDER_Q, _PLAYWRIGHT_THREAD
+    if _PLAYWRIGHT_RENDER_Q is not None:
+        return _PLAYWRIGHT_RENDER_Q
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    with _PLAYWRIGHT_LOCK:
+        if _PLAYWRIGHT_RENDER_Q is not None:
+            return _PLAYWRIGHT_RENDER_Q
+        import atexit
+
+        q = queue.Queue()
+
+        def _render_loop():
+            pw = browser = ctx = None
+            try:
+                while True:
+                    item = q.get()
+                    if item is _PLAYWRIGHT_SHUTDOWN:
+                        return
+                    html, fut = item
+                    try:
+                        if ctx is None:
+                            pw = sync_playwright().start()
+                            browser = pw.chromium.launch(
+                                headless=True,
+                                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                            )
+                            ctx = browser.new_context(
+                                user_agent="Mozilla/5.0 Wayback-Archive/Playwright",
+                                ignore_https_errors=True,
+                            )
+                        page = ctx.new_page()
+                        try:
+                            page.set_content(
+                                html, wait_until="networkidle", timeout=15000,
+                            )
+                            rendered = page.content()
+                        finally:
+                            page.close()
+                        fut.set_result(rendered)
+                    except Exception:
+                        fut.set_result(None)
+            finally:
+                for closer in (
+                    lambda: ctx and ctx.close(),
+                    lambda: browser and browser.close(),
+                    lambda: pw and pw.stop(),
+                ):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+
+        t = threading.Thread(target=_render_loop, name="wa-playwright-render",
+                              daemon=True)
+        t.start()
+
+        def _shutdown_render():
+            q.put(_PLAYWRIGHT_SHUTDOWN)
+            t.join(timeout=10)
+
+        atexit.register(_shutdown_render)
+        _PLAYWRIGHT_RENDER_Q = q
+        _PLAYWRIGHT_THREAD = t
+        return q
