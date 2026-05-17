@@ -923,9 +923,24 @@ class WaybackDownloader:
                 "&filter=!mimetype:warc/revisit"
                 f"{extra_params}"
             )
-            response = self.session.get(cdx_url, timeout=15)
-            response.raise_for_status()
-            rows = response.json()
+            # Route through the dashboard's CDX gate (if injected) so the
+            # shared rate-limit budget covers both repair-mode lookups and
+            # the normal crawl's CDX recovery. Falls back to session.get
+            # when no hook is configured.
+            cdx_urlopen = self.config.cdx_urlopen
+            if cdx_urlopen is not None:
+                import urllib.request
+                import json as _json
+                req = urllib.request.Request(
+                    cdx_url, headers={"User-Agent": "Wayback-Archive/1.0"},
+                )
+                with cdx_urlopen(req, timeout=15) as r:
+                    raw = r.read()
+                rows = _json.loads(raw) if raw else []
+            else:
+                response = self.session.get(cdx_url, timeout=15)
+                response.raise_for_status()
+                rows = response.json()
             # First row is the header.
             return [row[0] for row in rows[1:]] if len(rows) > 1 else []
 
@@ -2996,7 +3011,10 @@ class WaybackDownloader:
             return dl
 
         def _fetch_one(index: int, rel: str) -> RepairResult:
-            orig_url = _orig_url_from_rel(rel, scheme, host)
+            orig_url = _orig_url_from_rel(
+                rel, scheme, host,
+                query_string_suffix=cfg.query_string_suffix,
+            )
             ext = url_ext(orig_url)
             result = RepairResult(
                 rel=rel, orig_url=orig_url, index=index, total=total,
@@ -3142,9 +3160,19 @@ def _default_urlopen(req, timeout=15):
 
 
 _QUERY_HASH_SUFFIX_RE = re.compile(r"\.q-[0-9a-f]{8}(?=\.[^.]+$|$)")
+# Hostname-segment sniff: at least one dot, doesn't start with one, and
+# ends in a 2-6 letter TLD-ish suffix. Rejects directory names that just
+# happen to contain a dot — `.well-known`, `v1.2`, `node_modules`, etc.
+_HOSTNAME_SEG_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]+\.[A-Za-z]{2,6}$")
 
 
-def _orig_url_from_rel(rel: str, scheme: str, primary_host: str) -> str:
+def _orig_url_from_rel(
+    rel: str,
+    primary_scheme: str,
+    primary_host: str,
+    *,
+    query_string_suffix: bool = False,
+) -> str:
     """Reconstruct the original origin URL from a snapshot-rel path.
 
     `_get_local_path` preserves the full netloc as the first directory
@@ -3152,29 +3180,32 @@ def _orig_url_from_rel(rel: str, scheme: str, primary_host: str) -> str:
     any URL whose host isn't the primary). A rel path of
     `fonts.googleapis.com/css/...` came from
     `https://fonts.googleapis.com/css/...`, NOT from the primary
-    snapshot host. Detect that case by sniffing the first segment for a
-    hostname (contains a dot, not a relative-path indicator) and route
-    the URL accordingly.
+    snapshot host.
 
-    Best-effort strips any `.q-<8hex>` query-string-suffix the
-    downloader spliced into the filename stem. The exact original
-    query is lost (sha1 is one-way), so the reconstructed URL has no
-    query — repair() will fetch the query-less variant. Documenting
-    this here so consumers know the limitation.
+    Heuristic: the first path segment is treated as an origin host only
+    when it (a) is a *directory* — followed by `/`, and (b) matches
+    `_HOSTNAME_SEG_RE` (TLD-ish suffix, doesn't start with `.`). That
+    excludes legitimate path directories like `.well-known/`, `v1.2/`,
+    `node_modules/`. Cross-origin URLs always use `https://` since modern
+    CDNs (Google Fonts, Squarespace, jsDelivr…) are HTTPS-only — using
+    the snapshot's own scheme would 308 / fail for any http-anchored
+    archive.
+
+    When `query_string_suffix` is True, strips any `.q-<8hex>` segment
+    from the filename stem — that's the marker `_get_local_path`
+    splices in for query-bearing URLs. We only do this when the
+    config flag is on so a legitimate user filename like
+    `logo.q-deadbeef.png` isn't mangled. The original query can't be
+    recovered (sha1 is one-way), so the rebuilt URL has no query;
+    repair() fetches the query-less variant as best-effort.
     """
     rel = rel.lstrip("/")
-    rel = _QUERY_HASH_SUFFIX_RE.sub("", rel)
+    if query_string_suffix:
+        rel = _QUERY_HASH_SUFFIX_RE.sub("", rel)
     first_seg, sep, rest = rel.partition("/")
-    # Hostname heuristic: the first path segment is treated as an origin
-    # host only when it's a *directory* (sep == "/") whose name contains
-    # a dot. Root-level files like `foo.png` keep going to the primary
-    # host. False positives (a real subdir literally named `dotted.x/`)
-    # are vanishingly rare; the audit-generated rel paths the dashboard
-    # produces preserve hostnames as the first segment so this is the
-    # canonical inverse.
-    if sep and "." in first_seg and first_seg not in ("..", "."):
-        return f"{scheme}//{first_seg}/{rest}"
-    return f"{scheme}//{primary_host}/{rel}"
+    if sep and _HOSTNAME_SEG_RE.match(first_seg):
+        return f"https://{first_seg}/{rest}"
+    return f"{primary_scheme}//{primary_host}/{rel}"
 
 
 # --- Playwright render-thread singleton (one per process) -------------

@@ -191,10 +191,11 @@ def test_thread_local_downloaders(cfg, monkeypatch):
     assert len(set(seen_sessions)) == 3  # three distinct sessions
 
 
-def test_cross_origin_rel_routes_to_correct_host(cfg, monkeypatch):
+def test_cross_origin_rel_routes_to_correct_host_https(cfg, monkeypatch):
     """A rel path whose first segment is a hostname (Google Fonts,
-    Squarespace CDN, etc.) must be fetched from THAT host, not from the
-    snapshot's primary host."""
+    Squarespace CDN, etc.) must be fetched from THAT host over HTTPS —
+    modern CDNs are HTTPS-only and using the snapshot's own http://
+    would 308 / fail."""
     dl = WaybackDownloader(cfg)
     fetched = []
 
@@ -211,10 +212,69 @@ def test_cross_origin_rel_routes_to_correct_host(cfg, monkeypatch):
         ],
         workers=1,
     )
-    # Cross-origin rels go to their own host; primary-host rel stays primary.
-    assert "http://fonts.googleapis.com/css/foo.css" in fetched
+    # Cross-origin rels go HTTPS; primary-host rel uses snapshot scheme.
+    assert "https://fonts.googleapis.com/css/foo.css" in fetched
     assert "http://x.com/assets/local.png" in fetched
-    assert "http://images.squarespace-cdn.com/content/x.jpg" in fetched
+    assert "https://images.squarespace-cdn.com/content/x.jpg" in fetched
+
+
+def test_well_known_path_is_not_treated_as_hostname(cfg, monkeypatch):
+    """`.well-known/security.txt` is a legitimate path under the primary
+    host — must NOT be treated as hostname `.well-known`."""
+    dl = WaybackDownloader(cfg)
+    fetched = []
+
+    def fake_download(self, url):
+        fetched.append(url)
+        return b"bytes"
+
+    monkeypatch.setattr(WaybackDownloader, "download_file", fake_download)
+    dl.repair([".well-known/security.txt", "v1.2/app.js"], workers=1)
+    assert "http://x.com/.well-known/security.txt" in fetched
+    assert "http://x.com/v1.2/app.js" in fetched
+    # No bogus hostnames.
+    assert not any("//.well-known/" in u or "//v1.2/" in u for u in fetched)
+
+
+def test_search_snapshots_via_cdx_routes_through_cdx_urlopen(cfg, monkeypatch):
+    """`_search_snapshots_via_cdx` is the CDX recovery used by normal
+    crawl runs (not just repair). Must honor `cdx_urlopen` so the
+    dashboard's shared rate-limit budget covers both code paths."""
+    calls = []
+
+    class _Resp:
+        def __init__(self, body): self._body = body
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=15):
+        calls.append(req.full_url)
+        return _Resp(b'[["timestamp","statuscode","mimetype"]]')
+
+    cfg.cdx_urlopen = fake_urlopen
+    dl = WaybackDownloader(cfg)
+    dl._search_snapshots_via_cdx("http://x.com/missing.png")
+    # Two windowed queries (before-anchor + after-anchor).
+    assert len(calls) == 2
+    assert all("cdx/search/cdx" in u for u in calls)
+
+
+def test_query_hash_suffix_kept_when_flag_off(cfg, monkeypatch):
+    """A filename literally containing `.q-<8hex>` (a legitimate user
+    file, not a query-suffix marker) must NOT be stripped when
+    `query_string_suffix` is off."""
+    cfg.query_string_suffix = False
+    dl = WaybackDownloader(cfg)
+    fetched = []
+
+    def fake_download(self, url):
+        fetched.append(url)
+        return b"bytes"
+
+    monkeypatch.setattr(WaybackDownloader, "download_file", fake_download)
+    dl.repair(["assets/logo.q-deadbeef.png"], workers=1)
+    assert fetched == ["http://x.com/assets/logo.q-deadbeef.png"]
 
 
 def test_root_level_file_is_primary_host_not_treated_as_hostname(cfg, monkeypatch):
@@ -236,7 +296,8 @@ def test_query_hash_suffix_is_stripped_from_rel(cfg, monkeypatch):
     """Rel paths with a `.q-<hash>` suffix (produced by
     `query_string_suffix` on-disk filenames) lose the suffix on repair —
     the exact query can't be reconstructed from the sha1, so we fetch
-    the query-less variant as best-effort."""
+    the query-less variant as best-effort. Only when the flag is on."""
+    cfg.query_string_suffix = True
     dl = WaybackDownloader(cfg)
     fetched = []
 
