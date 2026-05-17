@@ -2897,3 +2897,227 @@ class WaybackDownloader:
             print(f"Corrupted fonts detected and removed: {len(self.corrupted_fonts)}", flush=True)
         print(f"Total files processed: {len(self.config.visited_urls)}", flush=True)
         print(f"{'='*70}\n", flush=True)
+
+    def repair(self, rel_paths, *, workers: int = 4,
+               on_result=None, on_alt_lookup=None):
+        """Re-fetch specific missing assets for an already-archived snapshot.
+
+        Targeted re-fetch driven by an explicit list of snapshot-relative
+        paths (as produced by an audit). For each rel:
+
+          1. Compute the local path; skip if the file is already on disk
+             and not an HTML-error masquerade.
+          2. Fetch ``orig_url`` via this downloader's ``download_file``
+             (which honors the resume / sandbox / masquerade Config
+             flags).
+          3. On miss, query Wayback CDX for alt timestamps and try each
+             via the raw ``id_`` endpoint, rejecting masquerades.
+          4. Classify failures: a `TransientCDXError` along the way means
+             the asset stays retryable; only a clean exhaustion of every
+             alt is permanently `unrecoverable=True`.
+          5. Write the bytes atomically to the local path.
+
+        Concurrency: each worker thread gets its own ``WaybackDownloader``
+        constructed from the same Config so each has its own
+        ``requests.Session`` (sessions are not thread-safe for parallel
+        use). The on_result callback is invoked from the main thread in
+        completion order; on_alt_lookup is invoked from worker threads.
+
+        Returns a `RepairSummary`. The dashboard's repair shim emits its
+        per-asset log lines from the on_result callback and merges
+        unrecoverable rel paths into its `.unrecoverable.json` sidecar.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from urllib.parse import urlparse as _urlparse
+        from wayback_archive.cdx import (
+            alt_timestamps as _alt_timestamps,
+            raw_fetch as _raw_fetch,
+            TransientCDXError as _TransientCDXError,
+        )
+        from wayback_archive.io_atomic import atomic_write_bytes
+        from wayback_archive.playback import looks_like_html_error, url_ext
+        from wayback_archive.repair import RepairResult, RepairSummary
+
+        # Dedupe + sanity.
+        rel_paths = [r for r in dict.fromkeys(rel_paths) if r]
+        total = len(rel_paths)
+        if total == 0:
+            return RepairSummary()
+
+        # Derive scheme/host from the configured Wayback URL.
+        base = self.config.base_url or ""
+        parsed_base = _urlparse(base)
+        scheme = f"{parsed_base.scheme}:" if parsed_base.scheme else "http:"
+        host = parsed_base.netloc
+        if not host:
+            raise ValueError(
+                f"repair() requires a WAYBACK_URL whose original URL has a netloc; got {base!r}"
+            )
+        ts_primary = getattr(self, "original_timestamp", "") or ""
+
+        out_root = Path(self.config.output_dir).resolve()
+        cfg = self.config
+        workers = max(1, min(workers, total))
+
+        # Per-thread downloader so each worker has its own requests.Session.
+        # Sessions aren't thread-safe for parallel calls into a single
+        # Session — sharing one would corrupt connection-pool state.
+        _dl_local = threading.local()
+
+        def _thread_dl():
+            dl = getattr(_dl_local, "downloader", None)
+            if dl is None:
+                dl = WaybackDownloader(cfg)
+                _dl_local.downloader = dl
+            return dl
+
+        def _fetch_one(index: int, rel: str) -> RepairResult:
+            orig_url = f"{scheme}//{host}/{rel.lstrip('/')}"
+            ext = url_ext(orig_url)
+            result = RepairResult(
+                rel=rel, orig_url=orig_url, index=index, total=total,
+                status="fail",
+            )
+            try:
+                local = (Path(cfg.output_dir) / rel).resolve()
+                if out_root not in local.parents and local != out_root:
+                    # Unsafe relative path — outside output_dir.
+                    result.status = "skip"
+                    return result
+
+                # Already on disk and not a masquerade? Skip.
+                if local.is_file() and local.stat().st_size > 0:
+                    try:
+                        with local.open("rb") as fh:
+                            head = fh.read(512)
+                    except OSError:
+                        head = b""
+                    if head and not looks_like_html_error(head, ext):
+                        result.status = "ok"
+                        result.bytes_written = local.stat().st_size
+                        # `skipped` is signaled via `from_fallback=False`
+                        # and `bytes_written>0`; the summary aggregator
+                        # uses a separate skipped counter below.
+                        result.tried_alts = 0
+                        result.unrecoverable = False
+                        # Mark via a sentinel: status="ok" with used_ts==None
+                        # AND from_fallback=False AND no actual fetch.
+                        # We'll distinguish in the aggregator via an
+                        # `_already_present` attribute.
+                        result._already_present = True  # type: ignore[attr-defined]
+                        return result
+
+                # Primary fetch.
+                dl = _thread_dl()
+                transient = False
+                try:
+                    content = dl.download_file(orig_url)
+                except Exception:
+                    content = None
+                    transient = True
+                used_ts = ts_primary if content else None
+                if content and looks_like_html_error(content, ext):
+                    content = None
+                from_fallback = False
+
+                # Alt-snapshot fallback if needed.
+                if not content:
+                    try:
+                        alts = _alt_timestamps(
+                            orig_url, ts_primary,
+                            limit=cfg.auto_search_snapshots_limit,
+                            urlopen=(cfg.cdx_urlopen
+                                     if cfg.cdx_urlopen is not None
+                                     else _default_urlopen),
+                        )
+                    except _TransientCDXError:
+                        alts = []
+                        transient = True
+                    result.tried_alts = len(alts)
+                    if on_alt_lookup is not None and alts:
+                        try:
+                            on_alt_lookup(rel, len(alts))
+                        except Exception:
+                            pass
+                    for alt in alts:
+                        try:
+                            data = _raw_fetch(
+                                dl.session, alt, orig_url,
+                                on_response=cfg.cdx_response_observer,
+                            )
+                        except _TransientCDXError:
+                            transient = True
+                            continue
+                        if not data or looks_like_html_error(data, ext):
+                            continue
+                        content = data
+                        used_ts = alt
+                        from_fallback = True
+                        break
+
+                if not content:
+                    result.status = "fail"
+                    result.unrecoverable = not transient
+                    return result
+
+                # Write atomically.
+                try:
+                    atomic_write_bytes(local, content)
+                except Exception:
+                    result.status = "fail"
+                    result.unrecoverable = False
+                    result.from_fallback = from_fallback
+                    return result
+
+                result.status = "ok"
+                result.from_fallback = from_fallback
+                result.used_ts = used_ts
+                result.bytes_written = len(content)
+                return result
+            except Exception:
+                # Catch-all so one worker error doesn't abort the pool.
+                result.status = "fail"
+                result.unrecoverable = False
+                return result
+
+        ok = failed = skipped = fallback_hits = 0
+        unrecoverable: list[str] = []
+        t0 = time.monotonic()
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="wa-repair") as ex:
+            futures = [ex.submit(_fetch_one, i, rel)
+                       for i, rel in enumerate(rel_paths, 1)]
+            for fut in as_completed(futures):
+                r = fut.result()
+                if r.status == "ok":
+                    if getattr(r, "_already_present", False):
+                        skipped += 1
+                    else:
+                        ok += 1
+                        if r.from_fallback:
+                            fallback_hits += 1
+                elif r.status == "fail":
+                    failed += 1
+                    if r.unrecoverable:
+                        unrecoverable.append(r.rel)
+                elif r.status == "skip":
+                    skipped += 1
+                if on_result is not None:
+                    try:
+                        on_result(r)
+                    except Exception:
+                        pass
+
+        return RepairSummary(
+            ok=ok, failed=failed, skipped=skipped,
+            fallback_hits=fallback_hits,
+            unrecoverable=sorted(unrecoverable),
+            duration_s=time.monotonic() - t0,
+        )
+
+
+def _default_urlopen(req, timeout=15):
+    """Module-level default for repair()'s CDX queries — kept here so the
+    callable is picklable / replaceable from outside tests."""
+    import urllib.request
+    return urllib.request.urlopen(req, timeout=timeout)
