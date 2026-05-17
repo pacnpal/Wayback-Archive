@@ -77,6 +77,32 @@ class TestWaybackDownloader:
         assert "page.html" in str(path)
         assert path.name == "page.html"
 
+    def test_query_suffix_consistency_between_save_path_and_link(self):
+        """When `query_string_suffix` is on, the on-disk filename
+        (`_get_local_path`) and the rewritten href
+        (`_get_relative_link_path`) must use the SAME `.q-<hash>` so
+        the browser finds the file the link points to. The query
+        belongs to the filename, NOT the href's `?query` tail."""
+        self.config.query_string_suffix = True
+        self.config.sandbox_local_paths = False
+        from wayback_archive.query_hash import suffix_for_query
+        url = "http://example.com/foo.png?v=1"
+        local = self.downloader._get_local_path(url)
+        href = self.downloader._get_relative_link_path(url, is_page=False)
+        expected_hash = suffix_for_query("v=1")
+        assert expected_hash in local.name
+        assert expected_hash in href
+        assert "?v=1" not in href
+
+    def test_query_in_link_preserved_when_suffix_off(self):
+        """With the flag off, the href keeps `?query` (historical
+        behavior)."""
+        self.config.query_string_suffix = False
+        url = "http://example.com/foo.png?v=1"
+        href = self.downloader._get_relative_link_path(url, is_page=False)
+        assert "?v=1" in href
+        assert ".q-" not in href
+
     @patch("wayback_archive.downloader.requests.Session.get")
     def test_download_file(self, mock_get):
         """Test file downloading."""

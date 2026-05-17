@@ -1,6 +1,7 @@
 """Core downloader module for Wayback-Archive."""
 
 import hashlib
+import logging
 import os
 import posixpath
 import queue
@@ -17,6 +18,8 @@ from typing import Optional, Set, Dict, List, Tuple
 import requests
 from bs4 import BeautifulSoup, Comment
 from wayback_archive.config import Config
+
+log = logging.getLogger("wayback_archive.downloader")
 
 
 class WaybackDownloader:
@@ -820,10 +823,25 @@ class WaybackDownloader:
             if not path.startswith("/"):
                 path = "/" + path
 
-        # Collect query/fragment suffix (not part of file path)
+        # Collect query/fragment suffix.
+        # When `query_string_suffix` is on, the file on disk is renamed
+        # with `.q-<hash>` spliced into its stem and NO `?query` part.
+        # The href must match that filename, so we drop the `?query`
+        # from the suffix and splice the same hash into `path` here —
+        # otherwise the saved file and the rewritten link diverge and
+        # the browser hits a 404 for every query-bearing internal asset.
         suffix = ""
         if parsed.query:
-            suffix += "?" + parsed.query
+            if self.config.query_string_suffix:
+                from wayback_archive.query_hash import suffix_for_query
+                qhash = suffix_for_query(parsed.query)
+                stem, dot, ext = path.rpartition(".")
+                if dot and "/" not in ext:
+                    path = f"{stem}{qhash}.{ext}"
+                else:
+                    path = path + qhash
+            else:
+                suffix += "?" + parsed.query
         if parsed.fragment:
             suffix += "#" + parsed.fragment
 
@@ -3072,6 +3090,13 @@ class WaybackDownloader:
                 return result
             except Exception:
                 # Catch-all so one worker error doesn't abort the pool.
+                # Log with traceback so repair regressions stay
+                # triageable from the run log — fail-open behavior is
+                # preserved.
+                log.error(
+                    "repair worker crashed on rel=%s url=%s",
+                    rel, orig_url, exc_info=True,
+                )
                 result.status = "fail"
                 result.unrecoverable = False
                 return result
