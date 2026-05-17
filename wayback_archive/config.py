@@ -109,7 +109,71 @@ class Config:
         if cdx_limit_str and cdx_limit_str.strip().isdigit():
             self.auto_search_snapshots_limit: int = max(1, int(cdx_limit_str.strip()))
         else:
-            self.auto_search_snapshots_limit: int = 10
+            # Bumped from 10 → 30 when the broadened-root-CDX behavior the
+            # dashboard's resume shim used was absorbed into this default.
+            # 30 alts is still a small CDX budget (one CDX search returns up
+            # to N timestamps, then up to N id_ fetches against them); the
+            # AUTO_SEARCH_SNAPSHOTS_LIMIT env var stays the per-job override.
+            self.auto_search_snapshots_limit: int = 30
+
+        # --- Wayback-quirk handling (absorbed from the dashboard's resume
+        # shim). Default ON — these are correctness/UX improvements every
+        # Wayback consumer benefits from. Set the corresponding env var
+        # (or set the Config attribute) to a falsy value to opt out per
+        # job.
+        # `resume_from_disk`: on `download_file`, serve from disk if the
+        # file already exists (and isn't an HTML-error masquerade).
+        # Job-level resume for crashed/retried runs.
+        self.resume_from_disk: bool = get_bool_env("RESUME_FROM_DISK", True)
+        # `sandbox_local_paths`: refuse URLs without a netloc and clamp
+        # every computed local path inside `output_dir`. Prevents the
+        # leak-to-mount-root bug where an un-absolutized relative URL got
+        # written to the filesystem root.
+        self.sandbox_local_paths: bool = get_bool_env("SANDBOX_LOCAL_PATHS", True)
+        # `query_string_suffix`: splice `.q-<sha1[:8]>` into the filename
+        # stem so same-path different-query URLs (foo.png?v=1 / foo.png?v=2)
+        # don't collide on disk. NOTE: the crawl's visited-URL dedupe
+        # (`_norm_track`) checks `query_string_suffix` and keeps the
+        # query in its visit-tracking key when this flag is on, so both
+        # variants reach the fetch path.
+        self.query_string_suffix: bool = get_bool_env("QUERY_STRING_SUFFIX", True)
+        # `purge_partial_on_start`: scan the output-dir's `.log` on init
+        # for an incomplete last-step line; remove its target file so a
+        # retried run doesn't see a half-written asset and skip
+        # refetching. Default OFF — `.log` is a dashboard-specific
+        # convention; the standalone CLI doesn't write one.
+        self.purge_partial_on_start: bool = get_bool_env("PURGE_PARTIAL_ON_START", False)
+        # `playwright_redirect_stub`: wrap session.get so off-archive
+        # redirects synthesize a tiny meta-refresh stub at the
+        # pre-redirect local path. Lets cross-path internal links resolve
+        # locally even when Wayback bounced through an old origin URL.
+        # Default OFF — meta-refresh stubs only matter when an HTML
+        # viewer reads the snapshot directly (the dashboard's case).
+        # Captures session.get at init so test suites that patch
+        # Session.get post-init want this off.
+        self.playwright_redirect_stub: bool = get_bool_env("PLAYWRIGHT_REDIRECT_STUB", False)
+        # `reject_html_masquerade`: on every download_file success, sniff
+        # the body against the URL's extension. If a `.gif`/`.png`/etc.
+        # comes back as `<!DOCTYPE html>`, return None instead of saving
+        # the corrupt bytes. Defaults ON — strictly more correct, cheap
+        # (first 512 bytes only), and never wrong: the only case it kills
+        # is a real Wayback error page being saved under a binary slot.
+        self.reject_html_masquerade: bool = get_bool_env("REJECT_HTML_MASQUERADE", True)
+
+        # --- Optional callbacks the dashboard injects for policy.
+        # `cdx_urlopen(req, timeout)` — replaces stdlib urlopen for CDX
+        # index queries so the dashboard's shared SQLite-backed rate-limit
+        # gate observes every CDX request.
+        self.cdx_urlopen = None
+        # `cdx_response_observer(response, request_url)` — invoked after
+        # every playback fetch in `wayback_archive.cdx.raw_fetch`. The
+        # dashboard uses it for Tunnelsmith outcome reporting, 429
+        # observation, and proxy-cascade-502 detection.
+        self.cdx_response_observer = None
+        # `metrics_observer(kind, **details)` — invoked from
+        # `download_file` with kind="cache_hit" or kind="net_call" so the
+        # dashboard shim can produce its per-run metrics summary line.
+        self.metrics_observer = None
 
         # Internal state
         self.base_url: Optional[str] = None
