@@ -48,6 +48,14 @@ def alt_timestamps(
     """Ask Wayback CDX for timestamps that archived `url` with statuscode 200,
     excluding `prefer_ts`, sorted by proximity to it.
 
+    Uses CDX's ``closest=<prefer_ts>`` parameter so the server returns
+    the limit captures nearest to `prefer_ts` (across the URL's full
+    history), not the limit OLDEST captures. Without this, a URL with
+    1000+ captures would have `limit=30` truncate to the 30 oldest and
+    the client-side proximity sort would have nothing nearby to pick.
+    The client-side sort below stays as a safety net for the
+    no-prefer_ts case.
+
     Returns ``[]`` for a clean empty result. Raises ``TransientCDXError``
     when the lookup failed for a retryable reason.
     """
@@ -58,6 +66,8 @@ def alt_timestamps(
         "fl": "timestamp,statuscode",
         "filter": "statuscode:200",
     }
+    if prefer_ts:
+        params["closest"] = prefer_ts
     q = urllib.parse.urlencode(params)
     cdx = f"https://web.archive.org/cdx/search/cdx?{q}"
     try:

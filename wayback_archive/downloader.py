@@ -967,6 +967,10 @@ class WaybackDownloader:
                 normalized_url = self._normalize_url(url, self.config.base_url)
                 self._mark_corrupted_font(normalized_url)
                 return None
+            if self.config.reject_html_masquerade:
+                from wayback_archive.playback import looks_like_html_error, url_ext
+                if looks_like_html_error(content, url_ext(url)):
+                    return None
             return content
         except Exception:
             return None
@@ -1206,7 +1210,10 @@ class WaybackDownloader:
                             self._mark_corrupted_font(normalized_url)
                             print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                             return None
-                        
+                        if self.config.reject_html_masquerade:
+                            from wayback_archive.playback import looks_like_html_error, url_ext
+                            if looks_like_html_error(content, url_ext(url)):
+                                return None
                         print(f"         ✓ Downloaded from original URL (fallback)", flush=True)
                         return content
                     except requests.exceptions.HTTPError:
@@ -1234,14 +1241,17 @@ class WaybackDownloader:
                         self._mark_corrupted_font(normalized_url)
                         print(f"         ⚠️  Font file is corrupted (HTML error page) - will be removed from CSS", flush=True)
                         return None
-                    
+                    if self.config.reject_html_masquerade:
+                        from wayback_archive.playback import looks_like_html_error, url_ext
+                        if looks_like_html_error(content, url_ext(url)):
+                            return None
                     print(f"         ✓ Downloaded from original URL (fallback)", flush=True)
                     return content
                 except Exception:
                     pass
         except Exception:
             pass
-        
+
         return None
     
     def _get_file_type_from_url(self, url: str) -> str:
@@ -2968,7 +2978,7 @@ class WaybackDownloader:
             return dl
 
         def _fetch_one(index: int, rel: str) -> RepairResult:
-            orig_url = f"{scheme}//{host}/{rel.lstrip('/')}"
+            orig_url = _orig_url_from_rel(rel, scheme, host)
             ext = url_ext(orig_url)
             result = RepairResult(
                 rel=rel, orig_url=orig_url, index=index, total=total,
@@ -3104,6 +3114,42 @@ def _default_urlopen(req, timeout=15):
     callable is picklable / replaceable from outside tests."""
     import urllib.request
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+_QUERY_HASH_SUFFIX_RE = re.compile(r"\.q-[0-9a-f]{8}(?=\.[^.]+$|$)")
+
+
+def _orig_url_from_rel(rel: str, scheme: str, primary_host: str) -> str:
+    """Reconstruct the original origin URL from a snapshot-rel path.
+
+    `_get_local_path` preserves the full netloc as the first directory
+    component for cross-origin assets (Google Fonts, Squarespace CDN,
+    any URL whose host isn't the primary). A rel path of
+    `fonts.googleapis.com/css/...` came from
+    `https://fonts.googleapis.com/css/...`, NOT from the primary
+    snapshot host. Detect that case by sniffing the first segment for a
+    hostname (contains a dot, not a relative-path indicator) and route
+    the URL accordingly.
+
+    Best-effort strips any `.q-<8hex>` query-string-suffix the
+    downloader spliced into the filename stem. The exact original
+    query is lost (sha1 is one-way), so the reconstructed URL has no
+    query — repair() will fetch the query-less variant. Documenting
+    this here so consumers know the limitation.
+    """
+    rel = rel.lstrip("/")
+    rel = _QUERY_HASH_SUFFIX_RE.sub("", rel)
+    first_seg, sep, rest = rel.partition("/")
+    # Hostname heuristic: the first path segment is treated as an origin
+    # host only when it's a *directory* (sep == "/") whose name contains
+    # a dot. Root-level files like `foo.png` keep going to the primary
+    # host. False positives (a real subdir literally named `dotted.x/`)
+    # are vanishingly rare; the audit-generated rel paths the dashboard
+    # produces preserve hostnames as the first segment so this is the
+    # canonical inverse.
+    if sep and "." in first_seg and first_seg not in ("..", "."):
+        return f"{scheme}//{first_seg}/{rest}"
+    return f"{scheme}//{primary_host}/{rel}"
 
 
 # --- Playwright render-thread singleton (one per process) -------------

@@ -38,6 +38,35 @@ def test_alt_timestamps_empty_body_returns_empty():
     assert got == []
 
 
+def test_alt_timestamps_sends_closest_param():
+    """The CDX query must include ``closest=<prefer_ts>`` so the server
+    returns the `limit` captures NEAREST to prefer_ts (not the limit
+    OLDEST). Without this, a URL with 1000s of captures has only its
+    oldest snapshots returned and the client-side proximity sort has
+    nothing nearby to pick."""
+    seen = {}
+
+    def _capture(req, timeout=15):
+        seen["url"] = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        return _FakeResp(b"")
+
+    alt_timestamps("http://x/", "20240101000000", urlopen=_capture)
+    assert "closest=20240101000000" in seen["url"]
+
+
+def test_alt_timestamps_omits_closest_when_prefer_ts_empty():
+    """An empty `prefer_ts` is a permitted no-op; don't send a
+    nonsensical `closest=` value."""
+    seen = {}
+
+    def _capture(req, timeout=15):
+        seen["url"] = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        return _FakeResp(b"")
+
+    alt_timestamps("http://x/", "", urlopen=_capture)
+    assert "closest=" not in seen["url"]
+
+
 def test_alt_timestamps_parses_and_sorts_by_proximity():
     # Proximity is raw-int distance on the 14-digit timestamp, mirroring the
     # dashboard's heuristic. Same-month captures are closer than prior-year.

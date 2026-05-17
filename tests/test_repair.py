@@ -189,3 +189,80 @@ def test_thread_local_downloaders(cfg, monkeypatch):
     rels = ["a.png", "b.png", "c.png"]
     dl.repair(rels, workers=3)
     assert len(set(seen_sessions)) == 3  # three distinct sessions
+
+
+def test_cross_origin_rel_routes_to_correct_host(cfg, monkeypatch):
+    """A rel path whose first segment is a hostname (Google Fonts,
+    Squarespace CDN, etc.) must be fetched from THAT host, not from the
+    snapshot's primary host."""
+    dl = WaybackDownloader(cfg)
+    fetched = []
+
+    def fake_download(self, url):
+        fetched.append(url)
+        return b"bytes"
+
+    monkeypatch.setattr(WaybackDownloader, "download_file", fake_download)
+    dl.repair(
+        [
+            "fonts.googleapis.com/css/foo.css",
+            "assets/local.png",
+            "images.squarespace-cdn.com/content/x.jpg",
+        ],
+        workers=1,
+    )
+    # Cross-origin rels go to their own host; primary-host rel stays primary.
+    assert "http://fonts.googleapis.com/css/foo.css" in fetched
+    assert "http://x.com/assets/local.png" in fetched
+    assert "http://images.squarespace-cdn.com/content/x.jpg" in fetched
+
+
+def test_root_level_file_is_primary_host_not_treated_as_hostname(cfg, monkeypatch):
+    """A bare root-level file like `foo.png` (dot in name, no `/` after)
+    must NOT be interpreted as a hostname `foo.png`."""
+    dl = WaybackDownloader(cfg)
+    fetched = []
+
+    def fake_download(self, url):
+        fetched.append(url)
+        return b"bytes"
+
+    monkeypatch.setattr(WaybackDownloader, "download_file", fake_download)
+    dl.repair(["foo.png"], workers=1)
+    assert fetched == ["http://x.com/foo.png"]
+
+
+def test_query_hash_suffix_is_stripped_from_rel(cfg, monkeypatch):
+    """Rel paths with a `.q-<hash>` suffix (produced by
+    `query_string_suffix` on-disk filenames) lose the suffix on repair —
+    the exact query can't be reconstructed from the sha1, so we fetch
+    the query-less variant as best-effort."""
+    dl = WaybackDownloader(cfg)
+    fetched = []
+
+    def fake_download(self, url):
+        fetched.append(url)
+        return b"bytes"
+
+    monkeypatch.setattr(WaybackDownloader, "download_file", fake_download)
+    dl.repair(["assets/foo.q-abcd1234.png"], workers=1)
+    assert fetched == ["http://x.com/assets/foo.png"]
+
+
+def test_masquerade_check_applied_to_alt_timestamp_fetch(cfg, monkeypatch):
+    """`_fetch_at_timestamp` must reject Wayback-error-page masquerade
+    bytes returned for a binary URL, not just the primary fetch."""
+    from wayback_archive.config import Config
+
+    cfg2 = Config()
+    cfg2.reject_html_masquerade = True
+    dl = WaybackDownloader(cfg2)
+
+    class _R:
+        status_code = 200
+        content = b"<!DOCTYPE html><html>err</html>"
+        def raise_for_status(self): pass
+
+    monkeypatch.setattr(dl, "session", type("S", (), {"get": lambda *a, **kw: _R()})())
+    out = dl._fetch_at_timestamp("http://x.com/foo.png", "20240101000000", False)
+    assert out is None
